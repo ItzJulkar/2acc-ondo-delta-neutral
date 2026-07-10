@@ -25,8 +25,8 @@ strategy:
   book_offset_ticks: 0
   size_tolerance: 0.0001
   poll_interval_sec: 0.5
-  # Only used for: (1) entry imbalance A vs C, (2) 5th-order emergency close.
-  # B/D at 1% are NEVER cancelled on this timer.
+  # Timer for: entry imbalance, dual-book close reprice, E-only lag reprice.
+  # B/D at target REST until target hit+stuck (dual) or one-sided (E).
   reprice_sec: 3.0
   cycle_pause_sec: 2.0
   max_reprice_attempts: 0

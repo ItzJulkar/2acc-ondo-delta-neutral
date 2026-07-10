@@ -21,9 +21,15 @@ class DeltaNeutralEngine:
            and REST until fill. Cancel/reprice ONLY if one side fills and the
            other does not (true imbalance).
 
-    B + D: placed with A/C at entry±1%. REST until fill. Do NOT cancel on a timer.
-           Only cancel D/B for the 5th-order path when one account is fully flat
-           and the other still has a position.
+    B + D: placed with A/C at close target (default 0.05% price ≈ 1% ROI @ 20x).
+           REST until fill — no timed cancel while waiting for target.
+
+    Dual book close (NOT E): if price already moved past the close target but
+           BOTH positions still open (B and D stuck) → cancel B+D and place
+           simultaneous book-price closes on BOTH accounts.
+
+    E (5th): ONLY when one account is fully flat and the other is not
+           (B filled / D not, or D filled / B not) → reprice lagging side only.
     """
 
     def __init__(self, cfg: AppConfig, acc1: OndoClient, acc2: OndoClient):
@@ -49,7 +55,8 @@ class DeltaNeutralEngine:
         self.stage_started = 0.0
         self.last_reprice = 0.0
         self.reprice_count = 0
-        self.emergency_active = False
+        self.emergency_active = False  # E path only
+        self.dual_book_close_active = False  # both B+D stuck after target
         self._bd_placed = False
 
     def stop(self) -> None:
@@ -403,9 +410,102 @@ class DeltaNeutralEngine:
                     allow_taker_fallback=False,
                 )
 
-    # ── 5th order only ────────────────────────────────────────────────
+    # ── Dual book close: BOTH B+D stuck after target move (NOT E) ─────
+
+    def _price_past_close_target(self) -> bool:
+        """True when mark has moved at least close_price_pct from entry (stuck B/D case)."""
+        if self.entry_ref <= 0:
+            return False
+        book = self._book()
+        mark = book.mark_price if book.mark_price > 0 else book.mid
+        if mark <= 0:
+            return False
+        pct = Decimal(str(self.cfg.strategy.close_price_pct)) / Decimal("100")
+        direction = self.cfg.strategy.close_direction
+        if direction == "down":
+            return mark <= self.entry_ref * (Decimal("1") - pct)
+        if direction == "up":
+            return mark >= self.entry_ref * (Decimal("1") + pct)
+        # either
+        move = abs(mark - self.entry_ref) / self.entry_ref
+        return move + Decimal("0.0000001") >= pct
+
+    def _dual_book_close(self) -> None:
+        """
+        B and D both stuck after price already hit the close target:
+        cancel B+D, place simultaneous book closes on BOTH accounts.
+        This is NOT the E order.
+        """
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        tol = self._tol()
+        if long_q <= tol or short_q <= tol:
+            return
+
+        book = self._book()
+        logger.info(
+            "DUAL BOOK CLOSE (not E): price past target, both still open "
+            "long=%s short=%s — cancel B+D, place both at book",
+            long_q,
+            short_q,
+        )
+
+        if self._is_open(self.order_b):
+            self.order_b = self._safe_cancel(self.acc1, self.order_b)
+            self.order_b = self._wait_cancel_settled(self.acc1, self.order_b)
+        if self._is_open(self.order_d):
+            self.order_d = self._safe_cancel(self.acc2, self.order_d)
+            self.order_d = self._wait_cancel_settled(self.acc2, self.order_d)
+
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        if long_q <= tol and short_q <= tol:
+            self.dual_book_close_active = False
+            return
+
+        # Same moment: close long + close short at current book
+        if long_q > tol:
+            px_b = self._aggressive_price(Side.SELL, book)
+            self.order_b = self._place(
+                self.acc1, Side.SELL, px_b, long_q, tag="B", post_only=False
+            )
+            logger.info("DUAL B sell (close long) @ %s size=%s", px_b, long_q)
+        if short_q > tol:
+            px_d = self._aggressive_price(Side.BUY, book)
+            self.order_d = self._place(
+                self.acc2, Side.BUY, px_d, short_q, tag="D", post_only=False
+            )
+            logger.info("DUAL D buy (close short) @ %s size=%s", px_d, short_q)
+
+        self.dual_book_close_active = True
+        self.emergency_active = False
+        self.last_reprice = time.time()
+        self.reprice_count += 1
+        self.stats.reprice_count = self.reprice_count
+
+    def _reprice_dual_book_close_if_needed(self) -> None:
+        """While dual book close is active and both still open, reprice both at book."""
+        if not self.dual_book_close_active:
+            return
+        if time.time() - self.last_reprice < self.cfg.strategy.reprice_sec:
+            return
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        if long_q <= self._tol() or short_q <= self._tol():
+            # became one-sided → leave dual path; E path will take over
+            self.dual_book_close_active = False
+            return
+        self._dual_book_close()
+
+    # ── 5th order E only (one side filled, other not) ─────────────────
 
     def _maybe_fifth_order(self) -> None:
+        """
+        E ONLY when:
+          - Acc1 flat (B done) but Acc2 still short (D not done), OR
+          - Acc2 flat (D done) but Acc1 still long (B not done).
+        Never used when both still open.
+        """
         long_q = self._filled_long()
         short_q = self._filled_short()
         tol = self._tol()
@@ -417,12 +517,14 @@ class DeltaNeutralEngine:
             self.emergency_active = False
             return
 
+        # One-sided → not dual book close
+        self.dual_book_close_active = False
         book = self._book()
         self.emergency_active = True
 
         if long_q <= tol and short_q > tol:
             logger.info(
-                "5TH: Acc1 flat, Acc2 short=%s — cancel D (if any), place E at book",
+                "E only: B/Acc1 done, D not done — cancel D, place E buy at book short=%s",
                 short_q,
             )
             if self._is_open(self.order_d):
@@ -438,14 +540,14 @@ class DeltaNeutralEngine:
             self.order_e = self._place(
                 self.acc2, Side.BUY, px, short_q, tag="E", post_only=False
             )
-            logger.info("5TH E buy @ %s size=%s", px, short_q)
+            logger.info("E buy @ %s size=%s", px, short_q)
             self.last_reprice = time.time()
             self.reprice_count += 1
             return
 
         if short_q <= tol and long_q > tol:
             logger.info(
-                "5TH: Acc2 flat, Acc1 long=%s — cancel B (if any), place E at book",
+                "E only: D/Acc2 done, B not done — cancel B, place E sell at book long=%s",
                 long_q,
             )
             if self._is_open(self.order_b):
@@ -461,12 +563,12 @@ class DeltaNeutralEngine:
             self.order_e = self._place(
                 self.acc1, Side.SELL, px, long_q, tag="E", post_only=False
             )
-            logger.info("5TH E sell @ %s size=%s", px, long_q)
+            logger.info("E sell @ %s size=%s", px, long_q)
             self.last_reprice = time.time()
             self.reprice_count += 1
 
     def _reprice_fifth_if_needed(self) -> None:
-        """Only the emergency E order may be cancelled/repriced on the timer."""
+        """E order only may be cancelled/repriced on the timer (one-sided lag)."""
         if not self.emergency_active:
             return
         if time.time() - self.last_reprice < self.cfg.strategy.reprice_sec:
@@ -483,6 +585,7 @@ class DeltaNeutralEngine:
         self.order_a = self.order_b = self.order_c = self.order_d = self.order_e = None
         self.reprice_count = 0
         self.emergency_active = False
+        self.dual_book_close_active = False
         self._bd_placed = False
         self.close_price = Decimal("0")
 
@@ -586,8 +689,8 @@ class DeltaNeutralEngine:
 
     def run(self) -> None:
         logger.info(
-            "Bot start | A/C rest at book mid | B/D rest at +%s%% | "
-            "cancel ONLY on entry imbalance or 5th-order stuck close | dry=%s",
+            "Bot start | A/C rest | B/D rest @ +%s%% price (~ROI*lev) | "
+            "dual-book if BOTH stuck after target | E only if one side done | dry=%s",
             self.cfg.strategy.close_price_pct,
             self.cfg.bot.dry_run,
         )
@@ -659,26 +762,36 @@ class DeltaNeutralEngine:
 
                     if self._both_flat():
                         logger.info(
-                            "CYCLE %s done | entry=%s close=%s 5th=%s",
+                            "CYCLE %s done | entry=%s close=%s E=%s dual_book=%s",
                             self.cycle,
                             self.stats.entry_price,
                             self.close_price,
                             self.emergency_active,
+                            self.dual_book_close_active,
                         )
                         self.stage = Stage.IDLE
                         self._sleep(self.cfg.strategy.cycle_pause_sec)
                         continue
 
-                    # One account flat, other not → 5th order only
+                    # E ONLY: one account fully closed, other still open
                     if self._acc1_flat() ^ self._acc2_flat():
+                        self.dual_book_close_active = False
                         if not self.emergency_active:
                             self._maybe_fifth_order()
                         else:
                             self._reprice_fifth_if_needed()
                     else:
-                        # Both still open: B and D REST — never cancel on timer
+                        # Both accounts still have positions
                         self.emergency_active = False
-                        self._ensure_bd_if_missing()
+                        if self.dual_book_close_active:
+                            # Already in dual book mode — reprice both at book on timer
+                            self._reprice_dual_book_close_if_needed()
+                        elif self._price_past_close_target():
+                            # Target already hit but B and D still stuck → dual book close
+                            self._dual_book_close()
+                        else:
+                            # Waiting for target: B/D rest, no cancel
+                            self._ensure_bd_if_missing()
 
                     self._sleep(self.cfg.strategy.poll_interval_sec)
                     continue
