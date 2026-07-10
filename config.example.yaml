@@ -1,0 +1,68 @@
+# Copy to config.yaml and adjust. Secrets stay in .env only.
+
+api:
+  base_url: "https://api.ondoperps.xyz"
+
+# Markets to rotate (or single market). Ondo symbols:
+#   XAU-USD.P = Gold 20x max
+#   XAG-USD.P = Silver 20x max
+markets:
+  - "XAU-USD.P"
+  - "XAG-USD.P"
+
+# Cycle mode: "rotate" = alternate markets each cycle, "all" not used yet
+market_mode: "rotate"
+
+leverage: 20
+
+# Position sizing
+sizing:
+  # Use at most this fraction of available margin on EACH account
+  margin_usage_pct: 40.0
+  # Cap notional per side (USD). 0 = no extra cap beyond margin
+  max_notional_usd: 0
+  # Minimum base size after rounding (skip cycle if below)
+  min_base_size: 0.001
+
+# Entry / close price targets
+strategy:
+  # Close when mark moves this % from entry (underlying price, NOT ROI)
+  # At 20x, 1% price move ≈ 20% position ROI
+  close_price_pct: 1.0
+  # close_direction:
+  #   "either"  — wait until |mark-entry| >= close_price_pct, then place B+D
+  #   "up"      — place B+D immediately at entry * (1 + pct)
+  #   "down"    — place B+D immediately at entry * (1 - pct)
+  close_direction: "either"
+  # Order placement style:
+  #   "fast_limit"   — aggressive limit near book (may take liquidity if crosses)
+  #   "strict_maker" — postOnly=true (reject if would take; reprice next tick)
+  order_mode: "fast_limit"
+  # How many ticks inside/at book for aggressive limits (0 = at best bid/ask)
+  book_offset_ticks: 0
+  # Partial-fill / size equality tolerance in base units
+  size_tolerance: 0.0001
+  # Seconds between status polls
+  poll_interval_sec: 0.5
+  # Unfilled lagging order: wait this long then cancel → reprice
+  reprice_sec: 3.0
+  # Pause between completed cycles
+  cycle_pause_sec: 2.0
+  # Max reprice attempts per stage before logging warning (0 = unlimited)
+  max_reprice_attempts: 0
+
+risk:
+  # Require estimated liq distance from entry >= this % (fail → shrink or skip)
+  min_liq_distance_pct: 7.0
+  # If true, reduce size until liq distance ok; if false, skip the cycle
+  shrink_to_fit_liq: true
+  # Abort bot if either account under liquidation flag
+  stop_on_liquidation: true
+
+bot:
+  dry_run: false
+  log_level: "INFO"
+  # Prefix for clientOrderId so we only cancel our own orders
+  order_prefix: "dn2_"
+  # Max cycles then exit (0 = run forever)
+  max_cycles: 0

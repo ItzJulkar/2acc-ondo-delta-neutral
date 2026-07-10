@@ -1,0 +1,38 @@
+api:
+  base_url: "https://api.ondoperps.xyz"
+
+markets:
+  - "XAU-USD.P"
+  - "XAG-USD.P"
+
+market_mode: "rotate"
+
+leverage: 20
+
+sizing:
+  margin_usage_pct: 40.0
+  max_notional_usd: 0
+  min_base_size: 0.001
+
+strategy:
+  close_price_pct: 1.0
+  close_direction: "either"
+  order_mode: "fast_limit"
+  book_offset_ticks: 0
+  size_tolerance: 0.0001
+  poll_interval_sec: 0.5
+  reprice_sec: 3.0
+  cycle_pause_sec: 2.0
+  max_reprice_attempts: 0
+
+risk:
+  min_liq_distance_pct: 7.0
+  # Pre-trade approx cannot guarantee 7% at 20x; post-fill liq is logged.
+  shrink_to_fit_liq: true
+  stop_on_liquidation: true
+
+bot:
+  dry_run: false
+  log_level: "INFO"
+  order_prefix: "dn2_"
+  max_cycles: 0
