@@ -69,6 +69,7 @@ class DeltaNeutralEngine:
         self.dual_book_close_active = False  # both B+D stuck after target
         self._bd_placed = False
         self._idle_until = 0.0
+        self._naked_abort_at = 0.0
 
     def stop(self) -> None:
         self._stop = True
@@ -197,8 +198,12 @@ class DeltaNeutralEngine:
         size: Decimal,
         *,
         tag: str,
+        post_only: bool = True,
     ) -> Optional[Order]:
-        """Always post-only maker. Never reduce-only IOC. Never taker fallback."""
+        """
+        Default: post-only maker.
+        post_only=False only for EMERGENCY naked flatten (never for normal A/B/C/D/E).
+        """
         if size <= self._tol():
             return None
         assert self.info is not None
@@ -213,13 +218,13 @@ class DeltaNeutralEngine:
                 price,
                 size,
                 reduce_only=False,
-                post_only=True,
+                post_only=post_only,
                 tag=tag,
             )
         except OndoAPIError as exc:
-            if exc.code == "post_only_has_match":
+            if exc.code == "post_only_has_match" and post_only:
                 logger.warning(
-                    "[%s] %s MAKER rejected @ %s (would take) — will reprice later, no taker",
+                    "[%s] %s MAKER rejected @ %s (would take) — reprice later, no taker",
                     client.name,
                     tag,
                     price,
@@ -718,29 +723,34 @@ class DeltaNeutralEngine:
 
     def _abort_naked_entry(self) -> None:
         """
-        If only one account has a position, cancel entries and flatten the naked
-        side with maker orders so we never sit unhedged.
+        If only one account has a position, cancel everything and flatten the
+        exposed side. Prefer maker; if still open after reprice window, one
+        emergency cross is allowed so we never sit naked.
         """
         long_q = self._filled_long()
         short_q = self._filled_short()
         tol = self._tol()
         book = self._book()
         logger.error(
-            "[%s] NAKED POSITION long=%s short=%s — cancel entries, maker-flatten exposed side",
+            "[%s] NAKED POSITION long=%s short=%s — flatten exposed side NOW",
             self.market,
             long_q,
             short_q,
         )
-        if self._is_open(self.order_a):
-            self.order_a = self._safe_cancel(self.acc1, self.order_a)
-        if self._is_open(self.order_c):
-            self.order_c = self._safe_cancel(self.acc2, self.order_c)
-        if self._is_open(self.order_b):
-            self.order_b = self._safe_cancel(self.acc1, self.order_b)
-        if self._is_open(self.order_d):
-            self.order_d = self._safe_cancel(self.acc2, self.order_d)
+        for od, cl in (
+            (self.order_a, self.acc1),
+            (self.order_b, self.acc1),
+            (self.order_c, self.acc2),
+            (self.order_d, self.acc2),
+            (self.order_e, self.acc1),
+            (self.order_e, self.acc2),
+        ):
+            if self._is_open(od):
+                self._safe_cancel(cl, od)
 
+        self._naked_abort_at = time.time()
         if long_q > tol and short_q <= tol:
+            # Join ask as maker first
             px = self._maker_price(Side.SELL, book)
             self.order_e = self._place(self.acc1, Side.SELL, px, long_q, tag="E")
             self.emergency_active = True
@@ -751,6 +761,42 @@ class DeltaNeutralEngine:
             self.emergency_active = True
             self.stage = Stage.EXIT
         self.last_reprice = time.time()
+
+    def _emergency_flatten_if_still_naked(self) -> None:
+        """If naked abort maker E did not fill, cross once to kill risk."""
+        if self._naked_abort_at <= 0:
+            return
+        if time.time() - self._naked_abort_at < self.cfg.strategy.reprice_sec:
+            return
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        tol = self._tol()
+        book = self._book()
+        assert self.info is not None
+        tick = self.info.quote_increment
+        if long_q > tol and short_q <= tol:
+            if self._is_open(self.order_e):
+                self.order_e = self._safe_cancel(self.acc1, self.order_e)
+            # Cross: sell through the bid (only emergency naked flatten)
+            px = book.best_bid if book.best_bid > 0 else book.mid
+            px = quantize_down(px * Decimal("0.999"), tick)
+            logger.error("[%s] EMERGENCY cross sell flatten long=%s @ %s", self.market, long_q, px)
+            self.order_e = self._place(
+                self.acc1, Side.SELL, px, long_q, tag="E", post_only=False
+            )
+            self._naked_abort_at = time.time()
+        elif short_q > tol and long_q <= tol:
+            if self._is_open(self.order_e):
+                self.order_e = self._safe_cancel(self.acc2, self.order_e)
+            px = book.best_ask if book.best_ask > 0 else book.mid
+            px = quantize_down(px * Decimal("1.001") + tick, tick)
+            logger.error("[%s] EMERGENCY cross buy flatten short=%s @ %s", self.market, short_q, px)
+            self.order_e = self._place(
+                self.acc2, Side.BUY, px, short_q, tag="E", post_only=False
+            )
+            self._naked_abort_at = time.time()
+        else:
+            self._naked_abort_at = 0.0
 
     def _on_hedge_open(self) -> None:
         long_q = self._filled_long()
@@ -837,9 +883,9 @@ class DeltaNeutralEngine:
                 # Naked risk: one side filled, other still zero after reprice window
                 one_sided = (long_q > tol and short_q <= tol) or (short_q > tol and long_q <= tol)
                 if one_sided and time.time() - self.stage_started >= max(
-                    self.cfg.strategy.reprice_sec * 3, 9.0
+                    self.cfg.strategy.reprice_sec * 2, 6.0
                 ):
-                    # Tried repricing lagging entry; still naked → flatten exposed side
+                    # Still naked after reprice attempts → flatten exposed side
                     self._abort_naked_entry()
                     return True
 
@@ -892,11 +938,16 @@ class DeltaNeutralEngine:
 
                 if self._acc1_flat() ^ self._acc2_flat():
                     self.dual_book_close_active = False
+                    if self._naked_abort_at > 0:
+                        self._emergency_flatten_if_still_naked()
                     if not self.emergency_active:
                         self._maybe_fifth_order()
                     else:
                         self._reprice_fifth_if_needed()
+                        if self._naked_abort_at > 0:
+                            self._emergency_flatten_if_still_naked()
                 else:
+                    self._naked_abort_at = 0.0
                     self.emergency_active = False
                     if self.dual_book_close_active:
                         self._reprice_dual_book_close_if_needed()
