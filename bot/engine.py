@@ -162,6 +162,7 @@ class DeltaNeutralEngine:
         tag: str,
         post_only: bool = False,
         reduce_only: bool = False,
+        allow_taker_fallback: bool = True,
     ) -> Optional[Order]:
         if size <= self._tol():
             return None
@@ -182,6 +183,14 @@ class DeltaNeutralEngine:
             )
         except OndoAPIError as exc:
             if exc.code == "post_only_has_match" and post_only:
+                if not allow_taker_fallback:
+                    logger.warning(
+                        "[%s] %s post-only rejected @ %s — no taker fallback (would fill now)",
+                        client.name,
+                        tag,
+                        price,
+                    )
+                    return None
                 logger.warning("[%s] %s post-only rejected @ %s — retry plain GTC", client.name, tag, price)
                 try:
                     return client.place_limit(
@@ -232,17 +241,22 @@ class DeltaNeutralEngine:
             self.acc1, Side.SELL, close_px, size, tag="B", post_only=False, reduce_only=False
         )
 
-        # D: buy close @ same +1% — post-only only (must not take now if above mark)
+        # D: buy close @ same price as B.
+        # Buy limit ABOVE the market is immediately marketable — it cannot REST.
+        #   post-only → exchange rejects (would take)
+        #   plain GTC → fills NOW at ~mark (closes short early / wrong) — DO NOT do this
+        # So when close_px > mark we do NOT place a resting D. When Acc1 later closes via B
+        # (price reached +1%), the 5th-order path places D/E at the book to close Acc2.
+        # When close_px <= mark (price already up), D can rest/join as post-only or GTC.
         if close_px > mark:
-            self.order_d = self._place(
-                self.acc2, Side.BUY, close_px, size, tag="D", post_only=True, reduce_only=False
+            self.order_d = None
+            logger.info(
+                "D NOT placed yet: buy limit @ %s is ABOVE mark %s so it cannot rest on the book "
+                "(B sell @ %s CAN rest). D/E will place when price is near close or Acc1 goes flat.",
+                close_px,
+                mark,
+                close_px,
             )
-            if self.order_d is None:
-                logger.info(
-                    "D cannot rest above mark as maker @ %s — stays unset until 5th-order path "
-                    "if Acc1 closes first while Acc2 still short",
-                    close_px,
-                )
         else:
             self.order_d = self._place(
                 self.acc2, Side.BUY, close_px, size, tag="D", post_only=True, reduce_only=False
@@ -370,16 +384,14 @@ class DeltaNeutralEngine:
                 )
 
         if short_q > self._tol() and not self._is_open(self.order_d):
-            if self.order_d is None or self.order_d.is_terminal:
-                if self.close_price > mark:
-                    logger.info(
-                        "D still cannot rest above mark — wait for 5th path if Acc1 closes first"
-                    )
-                else:
+            if self.order_d is None or (self.order_d.is_terminal and self.order_d.status != OrderStatus.FULLY_FILLED):
+                # Only place resting D if close is at/below mark (otherwise wait for 5th path)
+                if self.close_price <= mark:
                     logger.info("D missing — place once buy @ %s size=%s", self.close_price, short_q)
                     self.order_d = self._place(
                         self.acc2, Side.BUY, self.close_price, short_q, tag="D", post_only=True
                     )
+                # else: silent wait — do not spam logs
 
     # ── 5th order only ────────────────────────────────────────────────
 
