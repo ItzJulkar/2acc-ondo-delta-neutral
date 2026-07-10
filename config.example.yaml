@@ -10,8 +10,8 @@ markets:
   - "XAU-USD.P"
   - "XAG-USD.P"
 
-# Cycle mode: "rotate" = alternate markets each cycle, "all" not used yet
-market_mode: "rotate"
+# parallel = both markets run together | rotate = one market per cycle
+market_mode: "parallel"
 
 leverage: 20
 

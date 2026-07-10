@@ -32,17 +32,27 @@ class DeltaNeutralEngine:
            (B filled / D not, or D filled / B not) → reprice lagging side only.
     """
 
-    def __init__(self, cfg: AppConfig, acc1: OndoClient, acc2: OndoClient):
+    def __init__(
+        self,
+        cfg: AppConfig,
+        acc1: OndoClient,
+        acc2: OndoClient,
+        *,
+        fixed_market: Optional[str] = None,
+        margin_share: float = 1.0,
+    ):
         self.cfg = cfg
         self.acc1 = acc1
         self.acc2 = acc2
+        self.fixed_market = fixed_market
+        self.margin_share = margin_share
         self.stage = Stage.IDLE
         self.cycle = 0
         self.market_idx = 0
         self._stop = False
         self.stats = CycleStats()
 
-        self.market: str = ""
+        self.market: str = fixed_market or ""
         self.info: Optional[MarketInfo] = None
         self.target_size = Decimal("0")
         self.entry_ref = Decimal("0")
@@ -58,6 +68,7 @@ class DeltaNeutralEngine:
         self.emergency_active = False  # E path only
         self.dual_book_close_active = False  # both B+D stuck after target
         self._bd_placed = False
+        self._idle_until = 0.0
 
     def stop(self) -> None:
         self._stop = True
@@ -73,6 +84,8 @@ class DeltaNeutralEngine:
         return Decimal(str(self.cfg.strategy.size_tolerance))
 
     def _next_market(self) -> str:
+        if self.fixed_market:
+            return self.fixed_market
         markets = self.cfg.markets
         if not markets:
             raise RuntimeError("No markets configured")
@@ -638,7 +651,7 @@ class DeltaNeutralEngine:
         self._bd_placed = False
         self.close_price = Decimal("0")
 
-        logger.info("========== CYCLE %s | %s ==========", self.cycle, self.market)
+        logger.info("========== [%s] CYCLE %s ==========", self.market, self.cycle)
 
         self.info = self.acc1.get_market_info(self.market)
         lev = min(self.cfg.leverage, self.cfg.max_leverage_for(self.market), self.info.max_leverage)
@@ -681,8 +694,16 @@ class DeltaNeutralEngine:
             return False
 
         book = self._book()
-        size, ref, note = compute_equal_size(self.cfg, self.market, self.info, book, bal1, bal2)
-        logger.info("Sizing: %s", note)
+        size, ref, note = compute_equal_size(
+            self.cfg,
+            self.market,
+            self.info,
+            book,
+            bal1,
+            bal2,
+            margin_share=self.margin_share,
+        )
+        logger.info("[%s] Sizing: %s", self.market, note)
         ok, size, liq_msg = check_liq_buffer(self.cfg, ref, lev, size, self.info)
         logger.info("Liq: %s", liq_msg)
         if not ok or size <= 0:
@@ -736,126 +757,187 @@ class DeltaNeutralEngine:
         # Do not set last_reprice to force immediate cancel — B/D must rest
         self.last_reprice = time.time()
 
-    def run(self) -> None:
-        logger.info(
-            "Bot start | A/C rest | B/D rest @ +%s%% price (~ROI*lev) | "
-            "dual-book if BOTH stuck after target | E only if one side done | dry=%s",
-            self.cfg.strategy.close_price_pct,
-            self.cfg.bot.dry_run,
-        )
+    def tick(self) -> bool:
+        """
+        One state-machine step for this market. Returns False if permanently stopped.
+        Used by MultiMarketRunner so XAU and XAG advance in the same loop.
+        """
+        if self._stop or self.stage == Stage.STOPPED:
+            return False
+        if time.time() < self._idle_until:
+            return True
 
-        while not self._stop:
-            try:
+        try:
+            if (
+                self.cfg.bot.max_cycles
+                and self.cycle >= self.cfg.bot.max_cycles
+                and self.stage == Stage.IDLE
+            ):
+                logger.info("[%s] max_cycles reached", self.market or self.fixed_market)
+                self.stage = Stage.STOPPED
+                return False
+
+            if self.stage == Stage.IDLE:
+                if not self._start_cycle() and self.stage == Stage.IDLE:
+                    self._idle_until = time.time() + self.cfg.strategy.cycle_pause_sec
+                return True
+
+            if self.stage == Stage.ENTRY:
+                self.order_a = self._refresh_order(self.acc1, self.order_a)
+                self.order_c = self._refresh_order(self.acc2, self.order_c)
+                long_q = self._filled_long()
+                short_q = self._filled_short()
+                tol = self._tol()
+
+                if long_q >= self.target_size - tol and short_q >= self.target_size - tol:
+                    self._on_hedge_open()
+                    return True
+
                 if (
-                    self.cfg.bot.max_cycles
-                    and self.cycle >= self.cfg.bot.max_cycles
-                    and self.stage == Stage.IDLE
+                    abs(long_q - short_q) <= tol
+                    and long_q > tol
+                    and (not self._is_open(self.order_a))
+                    and (not self._is_open(self.order_c))
                 ):
-                    logger.info("max_cycles reached")
-                    break
-                if self.stage == Stage.STOPPED:
-                    break
+                    self._on_hedge_open()
+                    return True
 
-                if self.stage == Stage.IDLE:
-                    if not self._start_cycle() and self.stage == Stage.IDLE:
-                        self._sleep(self.cfg.strategy.cycle_pause_sec)
-                    continue
+                imbalanced = (long_q > tol and short_q < long_q - tol) or (
+                    short_q > tol and long_q < short_q - tol
+                )
+                if imbalanced and time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec:
+                    self._reprice_entry_imbalance_only()
+                elif (
+                    long_q <= tol
+                    and short_q <= tol
+                    and (not self._is_open(self.order_a) or not self._is_open(self.order_c))
+                    and time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec
+                ):
+                    self._reprice_entry_imbalance_only()
+                return True
 
-                if self.stage == Stage.ENTRY:
-                    self.order_a = self._refresh_order(self.acc1, self.order_a)
-                    self.order_c = self._refresh_order(self.acc2, self.order_c)
-                    long_q = self._filled_long()
-                    short_q = self._filled_short()
-                    tol = self._tol()
+            if self.stage == Stage.EXIT:
+                self.order_b = self._refresh_order(self.acc1, self.order_b)
+                self.order_d = self._refresh_order(self.acc2, self.order_d)
+                if self.order_e:
+                    owner = self.acc1 if self._filled_long() > self._tol() else self.acc2
+                    self.order_e = self._refresh_order(owner, self.order_e)
 
-                    # Both entries done
-                    if long_q >= self.target_size - tol and short_q >= self.target_size - tol:
-                        self._on_hedge_open()
-                        continue
-
-                    # Equal partial fills and both entry orders done
-                    if (
-                        abs(long_q - short_q) <= tol
-                        and long_q > tol
-                        and (not self._is_open(self.order_a))
-                        and (not self._is_open(self.order_c))
-                    ):
-                        self._on_hedge_open()
-                        continue
-
-                    # True imbalance only → reprice lagging side after reprice_sec
-                    imbalanced = (long_q > tol and short_q < long_q - tol) or (
-                        short_q > tol and long_q < short_q - tol
+                if self._both_flat():
+                    logger.info(
+                        "[%s] CYCLE %s done | entry=%s close=%s E=%s dual_book=%s",
+                        self.market,
+                        self.cycle,
+                        self.stats.entry_price,
+                        self.close_price,
+                        self.emergency_active,
+                        self.dual_book_close_active,
                     )
-                    if imbalanced and time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec:
-                        self._reprice_entry_imbalance_only()
-                    elif (
-                        long_q <= tol
-                        and short_q <= tol
-                        and (not self._is_open(self.order_a) or not self._is_open(self.order_c))
-                        and time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec
-                    ):
-                        # Orders missing (rejected), not "cancel working orders"
-                        self._reprice_entry_imbalance_only()
-                    # else: both resting unfilled → do NOTHING (no cancel)
+                    self.stage = Stage.IDLE
+                    self._idle_until = time.time() + self.cfg.strategy.cycle_pause_sec
+                    return True
 
-                    self._sleep(self.cfg.strategy.poll_interval_sec)
-                    continue
-
-                if self.stage == Stage.EXIT:
-                    self.order_b = self._refresh_order(self.acc1, self.order_b)
-                    self.order_d = self._refresh_order(self.acc2, self.order_d)
-                    if self.order_e:
-                        owner = self.acc1 if self._filled_long() > self._tol() else self.acc2
-                        self.order_e = self._refresh_order(owner, self.order_e)
-
-                    if self._both_flat():
-                        logger.info(
-                            "CYCLE %s done | entry=%s close=%s E=%s dual_book=%s",
-                            self.cycle,
-                            self.stats.entry_price,
-                            self.close_price,
-                            self.emergency_active,
-                            self.dual_book_close_active,
-                        )
-                        self.stage = Stage.IDLE
-                        self._sleep(self.cfg.strategy.cycle_pause_sec)
-                        continue
-
-                    # E ONLY: one account fully closed, other still open
-                    if self._acc1_flat() ^ self._acc2_flat():
-                        self.dual_book_close_active = False
-                        if not self.emergency_active:
-                            self._maybe_fifth_order()
-                        else:
-                            self._reprice_fifth_if_needed()
+                if self._acc1_flat() ^ self._acc2_flat():
+                    self.dual_book_close_active = False
+                    if not self.emergency_active:
+                        self._maybe_fifth_order()
                     else:
-                        # Both accounts still have positions
-                        self.emergency_active = False
-                        if self.dual_book_close_active:
-                            # Already in dual book mode — reprice both at book on timer
-                            self._reprice_dual_book_close_if_needed()
-                        elif self._price_past_close_target():
-                            # Target already hit but B and D still stuck → dual book close
-                            self._dual_book_close()
-                        else:
-                            # Waiting for target: B/D rest, no cancel
-                            self._ensure_bd_if_missing()
+                        self._reprice_fifth_if_needed()
+                else:
+                    self.emergency_active = False
+                    if self.dual_book_close_active:
+                        self._reprice_dual_book_close_if_needed()
+                    elif self._price_past_close_target():
+                        self._dual_book_close()
+                    else:
+                        self._ensure_bd_if_missing()
+                return True
 
-                    self._sleep(self.cfg.strategy.poll_interval_sec)
-                    continue
+            return True
+        except Exception:
+            logger.exception("[%s] tick error", self.market or self.fixed_market or "?")
+            self._idle_until = time.time() + 2.0
+            return True
 
-                self._sleep(self.cfg.strategy.poll_interval_sec)
-            except KeyboardInterrupt:
-                self._stop = True
-            except Exception:
-                logger.exception("Loop error")
-                self._sleep(2.0)
-
+    def shutdown(self) -> None:
+        self._stop = True
         try:
             if self.market:
                 self.acc1.cancel_open_bot_orders(self.market)
                 self.acc2.cancel_open_bot_orders(self.market)
         except Exception:  # noqa: BLE001
             pass
-        logger.info("Bot stopped")
+
+    def run(self) -> None:
+        logger.info(
+            "Bot start [%s] | B/D @ +%s%% | dual-book | E one-sided | dry=%s",
+            self.fixed_market or "rotate",
+            self.cfg.strategy.close_price_pct,
+            self.cfg.bot.dry_run,
+        )
+        while not self._stop and self.stage != Stage.STOPPED:
+            alive = self.tick()
+            if not alive:
+                break
+            self._sleep(self.cfg.strategy.poll_interval_sec)
+        self.shutdown()
+        logger.info("Bot stopped [%s]", self.market or self.fixed_market or "")
+
+
+class MultiMarketRunner:
+    """
+    Run XAU and XAG (or any configured markets) in parallel — each has its own
+    A/B/C/D state machine; one poll loop ticks all markets every interval.
+    """
+
+    def __init__(self, cfg: AppConfig, acc1: OndoClient, acc2: OndoClient):
+        self.cfg = cfg
+        self.acc1 = acc1
+        self.acc2 = acc2
+        self._stop = False
+        n = max(len(cfg.markets), 1)
+        # Split margin budget across markets so total stays near margin_usage_pct
+        share = 1.0 / n
+        self.engines = [
+            DeltaNeutralEngine(
+                cfg,
+                acc1,
+                acc2,
+                fixed_market=m,
+                margin_share=share,
+            )
+            for m in cfg.markets
+        ]
+
+    def stop(self) -> None:
+        self._stop = True
+        for e in self.engines:
+            e.stop()
+
+    def run(self) -> None:
+        markets = ", ".join(cfg.markets if (cfg := self.cfg) else [])
+        logger.info(
+            "Multi-market bot start | markets=[%s] | parallel | each margin share=1/%s | "
+            "close +%s%% | dry=%s",
+            markets,
+            max(len(self.cfg.markets), 1),
+            self.cfg.strategy.close_price_pct,
+            self.cfg.bot.dry_run,
+        )
+        try:
+            while not self._stop:
+                any_alive = False
+                for eng in self.engines:
+                    if eng.stage != Stage.STOPPED and not eng._stop:
+                        any_alive = eng.tick() or any_alive
+                if not any_alive:
+                    logger.info("All market engines stopped")
+                    break
+                time.sleep(self.cfg.strategy.poll_interval_sec)
+        except KeyboardInterrupt:
+            logger.info("Interrupted")
+            self.stop()
+        finally:
+            for eng in self.engines:
+                eng.shutdown()
+            logger.info("Multi-market bot stopped")

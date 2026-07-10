@@ -18,11 +18,14 @@ def compute_equal_size(
     book: BookTop,
     bal1: Balance,
     bal2: Balance,
+    margin_share: float = 1.0,
 ) -> Tuple[Decimal, Decimal, str]:
     """
     Return (base_size, ref_price, note).
     Size is equal on both accounts, capped by the weaker available margin
     and margin_usage_pct / leverage.
+
+    margin_share: in parallel multi-market mode use 1/N so total ≈ margin_usage_pct.
     """
     price = book.mid if book.mid > 0 else book.mark_price
     if price <= 0:
@@ -30,6 +33,8 @@ def compute_equal_size(
 
     leverage = min(cfg.leverage, cfg.max_leverage_for(market), info.max_leverage)
     usage = Decimal(str(cfg.sizing.margin_usage_pct)) / Decimal("100")
+    share = Decimal(str(max(margin_share, 0.01)))
+    usage = usage * share
 
     # Margin each account may use for this position
     m1 = bal1.available_margin * usage
@@ -51,7 +56,7 @@ def compute_equal_size(
         return Decimal("0"), price, f"size {base} < min {min_sz}"
 
     note = (
-        f"margin_budget=${margin_budget:.2f} lev={leverage}x "
+        f"margin_budget=${margin_budget:.2f} share={float(share):.2f} lev={leverage}x "
         f"notional=${float(base * price):.2f} size={base}"
     )
     return base, price, note

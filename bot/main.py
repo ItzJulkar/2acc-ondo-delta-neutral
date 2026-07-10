@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 
 from bot.client import OndoClient  # noqa: E402
 from bot.config import load_config  # noqa: E402
-from bot.engine import DeltaNeutralEngine  # noqa: E402
+from bot.engine import DeltaNeutralEngine, MultiMarketRunner  # noqa: E402
 
 
 def setup_logging(level: str) -> None:
@@ -114,12 +114,23 @@ def main() -> int:
         log.info("Check OK")
         return 0
 
-    engine = DeltaNeutralEngine(cfg, acc1, acc2)
-    try:
-        engine.run()
-    except KeyboardInterrupt:
-        log.info("Ctrl+C — shutting down")
-        engine.stop()
+    mode = (cfg.market_mode or "parallel").lower()
+    if mode == "parallel" and len(cfg.markets) > 1:
+        log.info("Starting PARALLEL engines for: %s", ", ".join(cfg.markets))
+        runner = MultiMarketRunner(cfg, acc1, acc2)
+        try:
+            runner.run()
+        except KeyboardInterrupt:
+            log.info("Ctrl+C — shutting down")
+            runner.stop()
+    else:
+        log.info("Starting single/rotate engine mode=%s markets=%s", mode, cfg.markets)
+        engine = DeltaNeutralEngine(cfg, acc1, acc2)
+        try:
+            engine.run()
+        except KeyboardInterrupt:
+            log.info("Ctrl+C — shutting down")
+            engine.stop()
     return 0
 
 

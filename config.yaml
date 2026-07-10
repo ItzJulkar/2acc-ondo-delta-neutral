@@ -5,7 +5,9 @@ markets:
   - "XAU-USD.P"
   - "XAG-USD.P"
 
-market_mode: "rotate"
+# parallel = XAU and XAG both trade at the same time (each gets margin_usage/N)
+# rotate  = one market per cycle (old behavior)
+market_mode: "parallel"
 
 leverage: 20
 
