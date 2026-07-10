@@ -272,30 +272,40 @@ class DeltaNeutralEngine:
             getattr(self.order_d, "order_id", None),
         )
 
-    def _max_resting_buy_px(self, book: BookTop) -> Decimal:
-        """Highest buy price that can rest as maker (must stay below best ask)."""
-        assert self.info is not None
-        tick = self.info.quote_increment
-        if book.best_ask > tick:
-            return quantize_down(book.best_ask - tick, tick)
-        if book.best_bid > 0:
-            return quantize_down(book.best_bid, tick)
-        return quantize_down(book.mid, tick)
-
     def _place_d_resting_limit(self, size: Decimal, close_px: Decimal) -> Optional[Order]:
         """
-        Always try to leave an OPEN D limit on acc2.
-        Prefer exact close_px when it can rest; else park at best_ask - tick (still open).
+        Always leave an OPEN D buy limit on acc2 (no TP/SL).
+
+        Exchange rule: a buy at close_px above the ask cannot rest (would take now).
+        So if close_px would cross the ask, park D a few ticks BELOW best bid so it
+        stays OPEN on the book (not filled instantly). When price hits the close
+        target with both sides still open → dual-book closes both at book.
+        If B fills first and D still open → E closes Acc2 only.
         """
         if size <= self._tol():
             return None
+        assert self.info is not None
         book = self._book()
-        max_rest = self._max_resting_buy_px(book)
-        # Use target if it won't cross the ask; else park just under ask so order is OPEN
-        d_px = close_px if close_px <= max_rest else max_rest
-        if d_px <= 0:
-            d_px = book.best_bid if book.best_bid > 0 else book.mid
-            d_px = quantize_down(d_px, self.info.quote_increment)  # type: ignore[union-attr]
+        tick = self.info.quote_increment
+        best_ask = book.best_ask if book.best_ask > 0 else book.mid
+        best_bid = book.best_bid if book.best_bid > 0 else book.mid
+
+        # Post-only buy must be strictly below best ask
+        max_rest = quantize_down(best_ask - tick, tick) if best_ask > tick else quantize_down(best_bid, tick)
+
+        if close_px <= max_rest:
+            d_px = close_px
+            parked = False
+        else:
+            # Park deep enough under bid so D stays open (not join-the-spread fill)
+            park_ticks = Decimal("5")
+            d_px = quantize_down(best_bid - park_ticks * tick, tick)
+            if d_px <= 0:
+                d_px = quantize_down(best_bid, tick)
+            # never park above target
+            if d_px > close_px:
+                d_px = close_px
+            parked = True
 
         o = self._place(
             self.acc2,
@@ -307,33 +317,32 @@ class DeltaNeutralEngine:
             reduce_only=False,
             allow_taker_fallback=False,
         )
-        if o is None:
-            # Join bid as last resort (still open limit, no SL)
-            bid = book.best_bid if book.best_bid > 0 else d_px
+        if o is None and parked:
+            # Fallback: join bid
             o = self._place(
                 self.acc2,
                 Side.BUY,
-                bid,
+                quantize_down(best_bid, tick),
                 size,
                 tag="D",
                 post_only=True,
                 reduce_only=False,
                 allow_taker_fallback=False,
             )
-            d_px = bid
+            if o:
+                d_px = quantize_down(best_bid, tick)
 
         if o:
-            if d_px < close_px:
-                logger.info(
-                    "D OPEN limit @ %s (parked under ask; target close=%s). "
-                    "Will dual-book both sides if still open after target.",
-                    d_px,
-                    close_px,
-                )
-            else:
-                logger.info("D OPEN limit @ %s (at target) id=%s", d_px, o.order_id)
+            logger.info(
+                "D OPEN on acc2 @ %s size=%s id=%s | B target close=%s%s",
+                d_px,
+                size,
+                o.order_id,
+                close_px,
+                " (parked below bid until dual-book/E)" if parked else " (at target)",
+            )
         else:
-            logger.error("D failed to place any resting limit — check acc2 balance/API")
+            logger.error("D still failed to place OPEN limit on acc2")
         return o
 
     # ── ENTRY: reprice ONLY on true one-sided fill ────────────────────
