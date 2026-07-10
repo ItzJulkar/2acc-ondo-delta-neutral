@@ -881,11 +881,16 @@ class DeltaNeutralEngine:
 
                 # Naked risk: one side filled, other still zero after reprice window
                 one_sided = (long_q > tol and short_q <= tol) or (short_q > tol and long_q <= tol)
-                if one_sided and time.time() - self.stage_started >= max(
-                    self.cfg.strategy.reprice_sec * 2, 6.0
-                ):
-                    # Still naked after reprice attempts → flatten exposed side
-                    self._abort_naked_entry()
+                # If one account fully filled and the other still 0 → reprice lagging a few times,
+                # then abort. Do not wait long with naked risk.
+                if one_sided:
+                    if time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec:
+                        self._reprice_entry_imbalance_only()
+                    if time.time() - self.stage_started >= max(
+                        self.cfg.strategy.reprice_sec * 2, 6.0
+                    ):
+                        self._abort_naked_entry()
+                        return True
                     return True
 
                 if long_q >= self.target_size - tol and short_q >= self.target_size - tol:
