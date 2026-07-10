@@ -230,29 +230,29 @@ class DeltaNeutralEngine:
 
     # ── A B C D once ──────────────────────────────────────────────────
 
-    def _place_abcd(self, entry_px: Decimal, size: Decimal) -> None:
-        """Place all four once. No timer cancel after this."""
+    def _place_ac_only(self, entry_px: Decimal, size: Decimal) -> None:
+        """
+        Place ONLY entry A+C (maker). Do NOT place B/D until both sides are filled.
+        Prevents naked long/short if one entry fills and the other does not.
+        """
         assert self.info is not None
         close_px = self._close_price_from_entry(entry_px)
         self.entry_ref = entry_px
         self.close_price = close_px
         self.stats.entry_price = entry_px
         book = self._book()
-        mark = book.mark_price if book.mark_price > 0 else book.mid
 
         logger.info(
-            "PLACE A+B+C+D once | size=%s entry=%s close=%s (+%s%%) — then REST (no 3s cancel)",
+            "[%s] PLACE A+C only (maker) | size=%s entry=%s | B/D after both filled | target close=%s",
+            self.market,
             size,
             entry_px,
             close_px,
-            self.cfg.strategy.close_price_pct,
         )
 
-        # A + C: same mid, MAKER only (post-only). If rejected, reprice later as maker.
         self.order_a = self._place(self.acc1, Side.BUY, entry_px, size, tag="A")
         self.order_c = self._place(self.acc2, Side.SELL, entry_px, size, tag="C")
         if self.order_a is None:
-            # Join bid as maker so Acc1 still has an open A
             self.order_a = self._place(
                 self.acc1, Side.BUY, self._maker_price(Side.BUY, book), size, tag="A"
             )
@@ -261,25 +261,43 @@ class DeltaNeutralEngine:
                 self.acc2, Side.SELL, self._maker_price(Side.SELL, book), size, tag="C"
             )
 
-        # B: sell @ close_px — above market → maker if post-only
-        self.order_b = self._place(self.acc1, Side.SELL, close_px, size, tag="B")
+        # Explicitly no B/D yet
+        self.order_b = None
+        self.order_d = None
+        self.order_e = None
+        self.emergency_active = False
+        self.dual_book_close_active = False
+        self._bd_placed = False
+        logger.info(
+            "[%s] Live ENTRY only A=%s C=%s (B/D deferred)",
+            self.market,
+            getattr(self.order_a, "order_id", None),
+            getattr(self.order_c, "order_id", None),
+        )
+
+    def _place_bd_after_hedge(self, size: Decimal) -> None:
+        """Place B+D only when both accounts already have matching positions."""
+        assert self.info is not None
+        if self.close_price <= 0:
+            self.close_price = self._close_price_from_entry(self.entry_ref or self._book_mid(self._book()))
+        book = self._book()
+        logger.info(
+            "[%s] PLACE B+D after hedge confirmed | size=%s close=%s",
+            self.market,
+            size,
+            self.close_price,
+        )
+        self.order_b = self._place(self.acc1, Side.SELL, self.close_price, size, tag="B")
         if self.order_b is None:
             self.order_b = self._place(
                 self.acc1, Side.SELL, self._maker_price(Side.SELL, book), size, tag="B"
             )
-
-        # D: maker buy that stays OPEN (park under bid if target would take)
-        self.order_d = self._place_d_resting_limit(size, close_px)
-
-        self.order_e = None
-        self.emergency_active = False
-        self.dual_book_close_active = False
+        self.order_d = self._place_d_resting_limit(size, self.close_price)
         self._bd_placed = True
         logger.info(
-            "Live orders A=%s B=%s C=%s D=%s — waiting for fills",
-            getattr(self.order_a, "order_id", None),
+            "[%s] Live CLOSE B=%s D=%s",
+            self.market,
             getattr(self.order_b, "order_id", None),
-            getattr(self.order_c, "order_id", None),
             getattr(self.order_d, "order_id", None),
         )
 
@@ -690,16 +708,67 @@ class DeltaNeutralEngine:
         self.target_size = size
         self.stats.target_size = size
         entry_px = self._book_mid(book)
-        self._place_abcd(entry_px, size)
+        # CRITICAL: only A+C now. B/D after both entries filled (no naked side).
+        self._place_ac_only(entry_px, size)
 
         self.stage = Stage.ENTRY
         self.stage_started = time.time()
         self.last_reprice = time.time()
         return True
 
+    def _abort_naked_entry(self) -> None:
+        """
+        If only one account has a position, cancel entries and flatten the naked
+        side with maker orders so we never sit unhedged.
+        """
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        tol = self._tol()
+        book = self._book()
+        logger.error(
+            "[%s] NAKED POSITION long=%s short=%s — cancel entries, maker-flatten exposed side",
+            self.market,
+            long_q,
+            short_q,
+        )
+        if self._is_open(self.order_a):
+            self.order_a = self._safe_cancel(self.acc1, self.order_a)
+        if self._is_open(self.order_c):
+            self.order_c = self._safe_cancel(self.acc2, self.order_c)
+        if self._is_open(self.order_b):
+            self.order_b = self._safe_cancel(self.acc1, self.order_b)
+        if self._is_open(self.order_d):
+            self.order_d = self._safe_cancel(self.acc2, self.order_d)
+
+        if long_q > tol and short_q <= tol:
+            px = self._maker_price(Side.SELL, book)
+            self.order_e = self._place(self.acc1, Side.SELL, px, long_q, tag="E")
+            self.emergency_active = True
+            self.stage = Stage.EXIT
+        elif short_q > tol and long_q <= tol:
+            px = self._maker_price(Side.BUY, book)
+            self.order_e = self._place(self.acc2, Side.BUY, px, short_q, tag="E")
+            self.emergency_active = True
+            self.stage = Stage.EXIT
+        self.last_reprice = time.time()
+
     def _on_hedge_open(self) -> None:
         long_q = self._filled_long()
         short_q = self._filled_short()
+        # Require BOTH sides — never place B/D on a one-sided fill
+        if long_q <= self._tol() or short_q <= self._tol():
+            self._abort_naked_entry()
+            return
+        if abs(long_q - short_q) > self._tol():
+            # Still imbalanced — keep entry reprice, do not open B/D
+            logger.warning(
+                "[%s] hedge not equal yet long=%s short=%s — wait/reprice entry, no B/D",
+                self.market,
+                long_q,
+                short_q,
+            )
+            return
+
         self.target_size = min(long_q, short_q)
         p1 = self.acc1.get_position(self.market)
         p2 = self.acc2.get_position(self.market)
@@ -707,13 +776,13 @@ class DeltaNeutralEngine:
         e2 = p2.average_entry_price if p2 else self.entry_ref
         self.entry_ref = (e1 + e2) / 2
         self.stats.entry_price = self.entry_ref
-        if self.close_price <= 0:
-            self.close_price = self._close_price_from_entry(self.entry_ref)
+        self.close_price = self._close_price_from_entry(self.entry_ref)
 
         _, m1 = post_fill_liq_ok(self.cfg, self.acc1, self.market, e1)
         _, m2 = post_fill_liq_ok(self.cfg, self.acc2, self.market, e2)
         logger.info(
-            "HEDGE OPEN size=%s entry≈%s | B/D REST @ %s (no cancel timer) | %s | %s",
+            "[%s] HEDGE CONFIRMED both sides size=%s entry≈%s | placing B/D @ %s | %s | %s",
+            self.market,
             self.target_size,
             self.entry_ref,
             self.close_price,
@@ -721,16 +790,16 @@ class DeltaNeutralEngine:
             m2,
         )
 
-        # Cancel leftover ENTRY orders only (A/C), never touch B/D here unless missing
+        # Cancel leftover ENTRY orders only
         if self._is_open(self.order_a):
             self.order_a = self._safe_cancel(self.acc1, self.order_a)
         if self._is_open(self.order_c):
             self.order_c = self._safe_cancel(self.acc2, self.order_c)
 
-        self._ensure_bd_if_missing()
+        # B/D only now that hedge is real
+        self._place_bd_after_hedge(self.target_size)
         self.stage = Stage.EXIT
         self.stage_started = time.time()
-        # Do not set last_reprice to force immediate cancel — B/D must rest
         self.last_reprice = time.time()
 
     def tick(self) -> bool:
@@ -765,6 +834,15 @@ class DeltaNeutralEngine:
                 short_q = self._filled_short()
                 tol = self._tol()
 
+                # Naked risk: one side filled, other still zero after reprice window
+                one_sided = (long_q > tol and short_q <= tol) or (short_q > tol and long_q <= tol)
+                if one_sided and time.time() - self.stage_started >= max(
+                    self.cfg.strategy.reprice_sec * 3, 9.0
+                ):
+                    # Tried repricing lagging entry; still naked → flatten exposed side
+                    self._abort_naked_entry()
+                    return True
+
                 if long_q >= self.target_size - tol and short_q >= self.target_size - tol:
                     self._on_hedge_open()
                     return True
@@ -772,8 +850,7 @@ class DeltaNeutralEngine:
                 if (
                     abs(long_q - short_q) <= tol
                     and long_q > tol
-                    and (not self._is_open(self.order_a))
-                    and (not self._is_open(self.order_c))
+                    and short_q > tol
                 ):
                     self._on_hedge_open()
                     return True
