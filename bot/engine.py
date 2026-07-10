@@ -255,21 +255,14 @@ class DeltaNeutralEngine:
             close_px,
         )
 
-        # Prefer same mid; if either rejects, both join bid/ask as maker (safer pair)
-        self.order_a = self._place(self.acc1, Side.BUY, entry_px, size, tag="A")
-        self.order_c = self._place(self.acc2, Side.SELL, entry_px, size, tag="C")
-        if self.order_a is None or self.order_c is None:
-            if self._is_open(self.order_a):
-                self.order_a = self._safe_cancel(self.acc1, self.order_a)
-            if self._is_open(self.order_c):
-                self.order_c = self._safe_cancel(self.acc2, self.order_c)
-            book = self._book()
-            self.order_a = self._place(
-                self.acc1, Side.BUY, self._maker_price(Side.BUY, book), size, tag="A"
-            )
-            self.order_c = self._place(
-                self.acc2, Side.SELL, self._maker_price(Side.SELL, book), size, tag="C"
-            )
+        # ALWAYS join book as maker on both sides at the same moment:
+        # A buy @ best bid, C sell @ best ask (pure maker pair; avoids mid one-sided fills).
+        book = self._book()
+        a_px = self._maker_price(Side.BUY, book)
+        c_px = self._maker_price(Side.SELL, book)
+        self.order_a = self._place(self.acc1, Side.BUY, a_px, size, tag="A")
+        self.order_c = self._place(self.acc2, Side.SELL, c_px, size, tag="C")
+        logger.info("[%s] A maker buy @ %s | C maker sell @ %s", self.market, a_px, c_px)
 
         # Explicitly no B/D yet
         self.order_b = None
