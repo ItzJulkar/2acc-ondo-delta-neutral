@@ -92,6 +92,12 @@ class DeltaNeutralEngine:
         return quantize_down(px, tick)
 
     def _close_price_from_entry(self, entry: Decimal) -> Decimal:
+        """
+        B/D price from entry.
+
+        close_price_pct is UNDERLYING price percent (e.g. 0.05 = 0.05% move).
+        At 20x leverage that is ~1% position ROI (0.05% * 20 = 1%).
+        """
         assert self.info is not None
         pct = Decimal(str(self.cfg.strategy.close_price_pct)) / Decimal("100")
         if self.cfg.strategy.close_direction == "down":

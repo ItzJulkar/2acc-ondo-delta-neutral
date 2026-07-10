@@ -26,9 +26,11 @@ sizing:
 
 # Entry / close price targets
 strategy:
-  # B/D limit offset from entry (underlying %, not ROI). At 20x ≈ 20% ROI per side.
-  close_price_pct: 1.0
-  # up = B/D at entry*(1+pct); down = entry*(1-pct)
+  # B/D close offset = UNDERLYING price % (not ROI).
+  # 20x + want ~1% ROI per side → price move = 1/20 = 0.05%
+  # Example: entry 4100 → B/D at 4100 * 1.0005 = 4102.05
+  close_price_pct: 0.05
+  # up = B/D at entry*(1+pct/100); down = entry*(1-pct/100)
   close_direction: "up"
   # strict_maker = postOnly limits (preferred). No exchange TP/SL used.
   # 5th order (E): only if one account is fully flat and the other still open —
