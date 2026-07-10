@@ -259,19 +259,28 @@ class OndoClient:
         post_only: bool = False,
         tag: str = "ord",
         client_order_id: Optional[str] = None,
+        take_profit: Optional[Decimal] = None,
+        stop_loss: Optional[Decimal] = None,
     ) -> Order:
         cid = client_order_id or self._new_client_id(tag)
-        body = {
+        # Ondo: reduce-only limits must be IOC (GTC reduce-only is rejected).
+        tif = "IOC" if reduce_only else "GTC"
+        body: dict[str, Any] = {
             "side": side.value,
             "market": market,
             "price": str(price),
             "size": str(size),
             "type": "limit",
-            "timeInForce": "GTC",
-            "postOnly": bool(post_only),
+            "timeInForce": tif,
+            "postOnly": bool(post_only) and not reduce_only,
             "reduceOnly": bool(reduce_only),
             "clientOrderId": cid,
         }
+        # Attached TP/SL are placed with the entry order (Ondo triggers as market on hit)
+        if take_profit is not None and take_profit > 0:
+            body["takeProfit"] = {"triggerPrice": str(take_profit)}
+        if stop_loss is not None and stop_loss > 0:
+            body["stopLoss"] = {"triggerPrice": str(stop_loss)}
         if self.dry_run:
             oid = f"dry_{uuid.uuid4().hex[:16]}"
             # Simulate instant fill for dry-run simplicity of the loop
@@ -311,6 +320,32 @@ class OndoClient:
 
         result = self._request("POST", "/v1/perps/orders", body=body) or {}
         return self._parse_order(result)
+
+    def set_stop_order(
+        self,
+        market: str,
+        position_direction: str,
+        stop_type: str,
+        trigger_price: Decimal,
+    ) -> Any:
+        """Position-level TP/SL. stop_type: takeProfit | stopLoss."""
+        body = {
+            "market": market,
+            "positionDirection": position_direction,
+            "type": stop_type,
+            "triggerPrice": str(trigger_price),
+        }
+        if self.dry_run:
+            logger.info(
+                "[%s] DRY set_stop %s %s %s @ %s",
+                self.name,
+                market,
+                position_direction,
+                stop_type,
+                trigger_price,
+            )
+            return body
+        return self._request("POST", "/v1/perps/stop_order", body=body)
 
     def get_order(self, order_id: str) -> Order:
         if self.dry_run and order_id in self._dry_orders:

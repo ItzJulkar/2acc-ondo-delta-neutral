@@ -26,16 +26,18 @@ Two separate Ondo accounts open **equal-and-opposite** positions on **XAU** / **
 ## Strategy (high level)
 
 ```
-1. Size  = min(acc1, acc2 available margin) × 40% × leverage / price
-2. Place A (buy) + C (sell) limit
-3. Poll fills
-   - Imbalance → cancel lagging order → wait final status → re-read positions
-     → place only residual size at current book → wait 3s → repeat
-4. When long_qty ≈ short_qty:
-   - close_direction = either → wait until |mark − entry| ≥ 1%
-   - then place B + D reduce-only limits (same price)
-5. Same reprice loop until both accounts flat
-6. Pause → next cycle (rotate XAU / XAG by default)
+1. Size = min(acc1, acc2 available margin) × 40% × leverage / price
+2. Place A + B + C + D TOGETHER (limit / maker, NO exchange TP/SL):
+   - A = Acc1 long entry @ P
+   - C = Acc2 short entry @ P (same size)
+   - B = Acc1 close sell @ P×(1+1%)
+   - D = Acc2 close buy @ same price as B
+3. When price moves ~1%, B and D fill → both flat ≈ net zero (minus fees)
+4. 5th order ONLY if needed:
+   - Acc1 fully flat (A+B done) but Acc2 still short (D not filled)
+     → cancel D → place E at current order-book price to close the short
+   - Symmetric if Acc2 flat but Acc1 still long
+5. When both flat → next cycle
 ```
 
 **1% = underlying price move**, not ROI. At 20×, a 1% price move is roughly ~20% position ROI on each side (opposite signs → combined ≈ flat minus fees/funding/slippage).

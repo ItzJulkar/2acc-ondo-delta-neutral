@@ -16,8 +16,10 @@ sizing:
 
 strategy:
   close_price_pct: 1.0
-  close_direction: "either"
-  order_mode: "fast_limit"
+  # B/D close price: up = entry*(1+1%), down = entry*(1-1%)
+  close_direction: "up"
+  # strict_maker | fast_limit — no exchange TP/SL; all bot closes are limit orders
+  order_mode: "strict_maker"
   book_offset_ticks: 0
   size_tolerance: 0.0001
   poll_interval_sec: 0.5

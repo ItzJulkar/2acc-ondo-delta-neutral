@@ -15,13 +15,16 @@ logger = logging.getLogger(__name__)
 
 class DeltaNeutralEngine:
     """
-    Two-account delta-neutral cycle on Ondo Perps.
+    Dual-account delta-neutral bot (maker limits).
 
-    Account 1: A = long entry limit,  B = reduce-only sell close
-    Account 2: C = short entry limit, D = reduce-only buy close
+    A (acc1 long entry) + C (acc2 short entry) — same price, same size.
+    B (acc1 close sell) + D (acc2 close buy) — same close price (entry ± 1%),
+    placed in the SAME step as A/C. No exchange TP/SL.
 
-    On imbalance: cancel lagging open order → wait confirm → re-read fills
-    → place only residual size at current book → wait reprice_sec → repeat.
+    Special case (5th order only when needed):
+      Acc1 fully flat (A+B done) but Acc2 still short (C filled, D not)
+        → cancel D → place new limit at current book so short closes.
+      Symmetric if Acc2 flat but Acc1 still long.
     """
 
     def __init__(self, cfg: AppConfig, acc1: OndoClient, acc2: OndoClient):
@@ -34,19 +37,20 @@ class DeltaNeutralEngine:
         self._stop = False
         self.stats = CycleStats()
 
-        # Live cycle state
         self.market: str = ""
         self.info: Optional[MarketInfo] = None
         self.target_size = Decimal("0")
         self.entry_ref = Decimal("0")
         self.close_price = Decimal("0")
         self.order_a: Optional[Order] = None
-        self.order_c: Optional[Order] = None
         self.order_b: Optional[Order] = None
+        self.order_c: Optional[Order] = None
         self.order_d: Optional[Order] = None
+        self.order_e: Optional[Order] = None  # 5th emergency close
         self.stage_started = 0.0
         self.last_reprice = 0.0
         self.reprice_count = 0
+        self.emergency_active = False
 
     def stop(self) -> None:
         self._stop = True
@@ -61,8 +65,9 @@ class DeltaNeutralEngine:
     def _tol(self) -> Decimal:
         return Decimal(str(self.cfg.strategy.size_tolerance))
 
-    def _post_only(self) -> bool:
-        return self.cfg.strategy.order_mode == "strict_maker"
+    def _want_maker(self) -> bool:
+        # Default: maker (post-only). fast_limit still uses limits, no market TP/SL.
+        return self.cfg.strategy.order_mode != "taker"
 
     def _next_market(self) -> str:
         markets = self.cfg.markets
@@ -76,36 +81,45 @@ class DeltaNeutralEngine:
     def _book(self) -> BookTop:
         return self.acc1.get_book_top(self.market)
 
-    def _price_for_side(self, side: Side, book: BookTop) -> Decimal:
-        """Aggressive limit aligned to book + optional tick offset."""
+    def _maker_price(self, side: Side, book: BookTop) -> Decimal:
+        """Join book as maker (post-only friendly)."""
         assert self.info is not None
         tick = self.info.quote_increment
         offset = Decimal(self.cfg.strategy.book_offset_ticks) * tick
         if side == Side.BUY:
-            # Join/near best bid; for faster fill can sit at best ask (may take)
-            if self._post_only():
-                px = book.best_bid - offset if book.best_bid > 0 else book.mid
-            else:
-                # fast_limit: place at best ask to cross/near-cross for fill
-                px = book.best_ask if book.best_ask > 0 else book.mid
-                px = px + offset
+            px = (book.best_bid if book.best_bid > 0 else book.mid) - offset
         else:
-            if self._post_only():
-                px = book.best_ask + offset if book.best_ask > 0 else book.mid
-            else:
-                px = book.best_bid if book.best_bid > 0 else book.mid
-                px = px - offset
+            px = (book.best_ask if book.best_ask > 0 else book.mid) + offset
         px = quantize_down(px, tick)
         if px <= 0:
             px = quantize_down(book.mid, tick)
         return px
 
-    def _same_entry_price(self, book: BookTop) -> Decimal:
-        """Single shared limit price for A (buy) and C (sell)."""
+    def _aggressive_limit_price(self, side: Side, book: BookTop) -> Decimal:
+        """Match current book for urgent close (5th order)."""
         assert self.info is not None
-        # Mid rounded to tick — both accounts post same price
+        tick = self.info.quote_increment
+        if side == Side.BUY:
+            px = book.best_ask if book.best_ask > 0 else book.mid
+        else:
+            px = book.best_bid if book.best_bid > 0 else book.mid
+        return quantize_down(px, tick)
+
+    def _same_entry_price(self, book: BookTop) -> Decimal:
+        assert self.info is not None
         mid = book.mid if book.mid > 0 else book.mark_price
         return quantize_down(mid, self.info.quote_increment)
+
+    def _close_price_from_entry(self, entry: Decimal) -> Decimal:
+        assert self.info is not None
+        pct = Decimal(str(self.cfg.strategy.close_price_pct)) / Decimal("100")
+        direction = self.cfg.strategy.close_direction
+        if direction == "down":
+            px = entry * (Decimal("1") - pct)
+        else:
+            # up (default): B/D at entry + 1%
+            px = entry * (Decimal("1") + pct)
+        return quantize_down(px, self.info.quote_increment)
 
     def _filled_long(self) -> Decimal:
         return self.acc1.position_qty(self.market, want_long=True)
@@ -116,12 +130,11 @@ class DeltaNeutralEngine:
     def _both_flat(self) -> bool:
         return self._filled_long() <= self._tol() and self._filled_short() <= self._tol()
 
-    def _positions_balanced(self) -> bool:
-        a = self._filled_long()
-        b = self._filled_short()
-        if a <= self._tol() and b <= self._tol():
-            return False
-        return abs(a - b) <= self._tol()
+    def _acc1_flat(self) -> bool:
+        return self._filled_long() <= self._tol()
+
+    def _acc2_flat(self) -> bool:
+        return self._filled_short() <= self._tol()
 
     def _refresh_order(self, client: OndoClient, order: Optional[Order]) -> Optional[Order]:
         if not order or not order.order_id:
@@ -129,7 +142,7 @@ class DeltaNeutralEngine:
         try:
             return client.get_order(order.order_id)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("[%s] get_order %s failed: %s", client.name, order.order_id, exc)
+            logger.warning("[%s] get_order failed: %s", client.name, exc)
             return order
 
     def _safe_cancel(self, client: OndoClient, order: Optional[Order]) -> Optional[Order]:
@@ -138,14 +151,14 @@ class DeltaNeutralEngine:
         if order.status in (OrderStatus.FULLY_FILLED, OrderStatus.CANCELED):
             return order
         try:
-            updated = client.cancel_order(order.order_id)
-            return updated or order
+            return client.cancel_order(order.order_id) or order
         except Exception as exc:  # noqa: BLE001
             logger.warning("[%s] cancel failed: %s", client.name, exc)
             return self._refresh_order(client, order)
 
-    def _wait_cancel_settled(self, client: OndoClient, order: Optional[Order], timeout: float = 5.0) -> Optional[Order]:
-        """Ensure cancel/fill final state before placing replacement (avoid double position)."""
+    def _wait_cancel_settled(
+        self, client: OndoClient, order: Optional[Order], timeout: float = 5.0
+    ) -> Optional[Order]:
         if not order:
             return order
         deadline = time.time() + timeout
@@ -157,15 +170,16 @@ class DeltaNeutralEngine:
             time.sleep(0.15)
         return self._refresh_order(client, cur) or cur
 
-    def _place_limit(
+    def _place(
         self,
         client: OndoClient,
         side: Side,
         price: Decimal,
         size: Decimal,
         *,
-        reduce_only: bool,
         tag: str,
+        post_only: bool,
+        reduce_only: bool = False,
     ) -> Optional[Order]:
         if size <= self._tol():
             return None
@@ -181,110 +195,197 @@ class DeltaNeutralEngine:
                 price,
                 size,
                 reduce_only=reduce_only,
-                post_only=self._post_only(),
+                post_only=post_only,
                 tag=tag,
+                # NO take_profit / stop_loss — user does not want TP/SL
             )
         except OndoAPIError as exc:
-            if exc.code == "post_only_has_match" and self._post_only():
-                logger.warning("[%s] post-only rejected (would take) — will reprice", client.name)
+            if exc.code == "post_only_has_match" and post_only:
+                logger.warning("[%s] %s post-only rejected @ %s", client.name, tag, price)
                 return None
-            logger.error("[%s] place_limit failed: %s", client.name, exc)
-            raise
+            logger.error("[%s] place %s failed: %s", client.name, tag, exc)
+            return None
 
-    # ── stages ────────────────────────────────────────────────────────
+    # ── place A B C D together ────────────────────────────────────────
 
-    def _start_cycle(self) -> bool:
-        self.cycle += 1
-        self.market = self._next_market()
-        self.stats = CycleStats(cycle_id=self.cycle, market=self.market)
-        self.order_a = self.order_b = self.order_c = self.order_d = None
-        self.reprice_count = 0
-        self.close_price = Decimal("0")
-
-        logger.info("========== CYCLE %s | %s ==========", self.cycle, self.market)
-
-        # Market meta (public)
-        self.info = self.acc1.get_market_info(self.market)
-        lev = min(self.cfg.leverage, self.cfg.max_leverage_for(self.market), self.info.max_leverage)
-        self.acc1.set_leverage(self.market, lev)
-        self.acc2.set_leverage(self.market, lev)
-
-        # Cancel leftover bot orders
-        self.acc1.cancel_open_bot_orders(self.market)
-        self.acc2.cancel_open_bot_orders(self.market)
-
-        # Refuse if residual exposure
-        if not self._both_flat():
-            logger.error(
-                "Residual positions: acc1 long=%s acc2 short=%s — reconcile before new cycle",
-                self._filled_long(),
-                self._filled_short(),
-            )
-            self.stage = Stage.RECONCILE
-            return False
-
-        bal1 = self.acc1.get_balance()
-        bal2 = self.acc2.get_balance()
-        if self.cfg.risk.stop_on_liquidation and (bal1.under_liquidation or bal2.under_liquidation):
-            logger.error("Account under liquidation — stopping")
-            self.stage = Stage.STOPPED
-            self._stop = True
-            return False
-
+    def _place_abcd(self, entry_px: Decimal, size: Decimal) -> None:
+        assert self.info is not None
+        close_px = self._close_price_from_entry(entry_px)
+        self.entry_ref = entry_px
+        self.close_price = close_px
+        self.stats.entry_price = entry_px
         book = self._book()
-        size, ref, note = compute_equal_size(self.cfg, self.market, self.info, book, bal1, bal2)
-        logger.info("Sizing: %s | bal1_avail=%s bal2_avail=%s", note, bal1.available_margin, bal2.available_margin)
+        mark = book.mark_price if book.mark_price > 0 else book.mid
+        maker = self._want_maker()
 
-        ok, size, liq_msg = check_liq_buffer(self.cfg, ref, lev, size, self.info)
-        logger.info("Liq pre-check: %s", liq_msg)
-        if not ok or size <= 0:
-            logger.warning("Skip cycle — cannot size safely")
-            self.stage = Stage.IDLE
-            self._sleep(self.cfg.strategy.cycle_pause_sec)
-            return False
-
-        self.target_size = size
-        self.entry_ref = ref
-        self.stats.target_size = size
-        self.stats.entry_price = ref
-
-        # Place A + C at same price
-        entry_px = self._same_entry_price(book)
         logger.info(
-            "ENTRY: A buy + C sell size=%s @ %s (mode=%s)",
+            "PLACE A+B+C+D together (no TP/SL) | size=%s entry=%s close=%s (+%s%%) maker=%s",
             size,
             entry_px,
-            self.cfg.strategy.order_mode,
+            close_px,
+            self.cfg.strategy.close_price_pct,
+            maker,
         )
-        self.order_a = self._place_limit(self.acc1, Side.BUY, entry_px, size, reduce_only=False, tag="A")
-        self.order_c = self._place_limit(self.acc2, Side.SELL, entry_px, size, reduce_only=False, tag="C")
-        self.stage = Stage.ENTRY
-        self.stage_started = time.time()
-        self.last_reprice = time.time()
-        return True
 
-    def _reprice_entry_imbalance(self) -> None:
-        """If one account filled more, cancel lagging order and re-place residual."""
+        # A: long entry @ entry (maker join bid)
+        a_px = entry_px
+        if maker:
+            a_px = self._maker_price(Side.BUY, book)
+            # Keep A/C same price — use shared entry mid; post-only on both
+            a_px = entry_px
+        self.order_a = self._place(
+            self.acc1, Side.BUY, a_px, size, tag="A", post_only=maker, reduce_only=False
+        )
+
+        # C: short entry @ same entry price
+        self.order_c = self._place(
+            self.acc2, Side.SELL, entry_px, size, tag="C", post_only=maker, reduce_only=False
+        )
+
+        # B: close long @ close_px (sell above market rests as maker when close > mark)
+        b_post = maker and close_px >= mark
+        self.order_b = self._place(
+            self.acc1, Side.SELL, close_px, size, tag="B", post_only=b_post, reduce_only=False
+        )
+        if self.order_b is None and b_post:
+            self.order_b = self._place(
+                self.acc1, Side.SELL, close_px, size, tag="B", post_only=False, reduce_only=False
+            )
+
+        # D: close short @ same close_px as B
+        # Buy limit ABOVE market cannot rest as maker (would take immediately).
+        # Still submit post-only at close_px; if rejected, D stays None until 5th-order path
+        # OR until book reaches close (then we re-place).
+        d_post = True if maker else False
+        if close_px > mark:
+            self.order_d = self._place(
+                self.acc2, Side.BUY, close_px, size, tag="D", post_only=True, reduce_only=False
+            )
+            if self.order_d is None:
+                logger.info(
+                    "D post-only @ %s not restable above mark %s — will use 5th order "
+                    "only if Acc1 closes first while Acc2 short remains",
+                    close_px,
+                    mark,
+                )
+        else:
+            self.order_d = self._place(
+                self.acc2, Side.BUY, close_px, size, tag="D", post_only=d_post, reduce_only=False
+            )
+            if self.order_d is None and d_post:
+                self.order_d = self._place(
+                    self.acc2, Side.BUY, close_px, size, tag="D", post_only=False, reduce_only=False
+                )
+
+        self.order_e = None
+        self.emergency_active = False
+        logger.info(
+            "Submitted A=%s B=%s C=%s D=%s",
+            getattr(self.order_a, "order_id", None),
+            getattr(self.order_b, "order_id", None),
+            getattr(self.order_c, "order_id", None),
+            getattr(self.order_d, "order_id", None),
+        )
+
+    # ── 5th order: only when one account fully closed, other still open ─
+
+    def _maybe_fifth_order(self) -> None:
+        """
+        Req: Acc1 flat (A+B done) but Acc2 still short (C done, D not)
+          → cancel D → place E at current book to close short.
+        Symmetric if Acc2 flat and Acc1 still long.
+        Do NOT place E while both accounts still have positions (B/D still working).
+        """
         long_q = self._filled_long()
         short_q = self._filled_short()
-        logger.info("ENTRY reconcile long=%s short=%s target=%s", long_q, short_q, self.target_size)
+        tol = self._tol()
 
-        # Refresh open orders
-        self.order_a = self._refresh_order(self.acc1, self.order_a)
-        self.order_c = self._refresh_order(self.acc2, self.order_c)
+        # Both still open → B/D only, no 5th order
+        if long_q > tol and short_q > tol:
+            self.emergency_active = False
+            return
 
-        # Need more long on acc1?
-        need_long = self.target_size - long_q
-        need_short = self.target_size - short_q
-
-        # Cap residual by the smaller remaining need so we don't overshoot one side forever
-        # Strategy: each side independently chases its own target_size; balance enforced later
-        max_rep = self.cfg.strategy.max_reprice_attempts
-        if max_rep and self.reprice_count >= max_rep:
-            logger.warning("Max reprice attempts reached in ENTRY")
+        # Both flat → nothing
+        if long_q <= tol and short_q <= tol:
+            self.emergency_active = False
             return
 
         book = self._book()
+        self.emergency_active = True
+
+        # Acc1 flat, Acc2 still short → close short with E (replace D)
+        if long_q <= tol and short_q > tol:
+            logger.info(
+                "5TH ORDER path: Acc1 flat but Acc2 short=%s — cancel D, place book close",
+                short_q,
+            )
+            if self.order_d and self.order_d.is_open:
+                self.order_d = self._safe_cancel(self.acc2, self.order_d)
+                self.order_d = self._wait_cancel_settled(self.acc2, self.order_d)
+            if self.order_e and self.order_e.is_open:
+                self.order_e = self._safe_cancel(self.acc2, self.order_e)
+                self.order_e = self._wait_cancel_settled(self.acc2, self.order_e)
+
+            short_q = self._filled_short()
+            if short_q <= tol:
+                return
+            # Match order book current price (urgent close)
+            px = self._aggressive_limit_price(Side.BUY, book)
+            # Prefer maker join first; if user needs fill, use book match without post-only
+            self.order_e = self._place(
+                self.acc2, Side.BUY, px, short_q, tag="E", post_only=False, reduce_only=False
+            )
+            logger.info("5TH E: buy close short size=%s @ %s", short_q, px)
+            self.last_reprice = time.time()
+            self.reprice_count += 1
+            return
+
+        # Acc2 flat, Acc1 still long → close long with E (replace B)
+        if short_q <= tol and long_q > tol:
+            logger.info(
+                "5TH ORDER path: Acc2 flat but Acc1 long=%s — cancel B, place book close",
+                long_q,
+            )
+            if self.order_b and self.order_b.is_open:
+                self.order_b = self._safe_cancel(self.acc1, self.order_b)
+                self.order_b = self._wait_cancel_settled(self.acc1, self.order_b)
+            if self.order_e and self.order_e.is_open:
+                self.order_e = self._safe_cancel(self.acc1, self.order_e)
+                self.order_e = self._wait_cancel_settled(self.acc1, self.order_e)
+
+            long_q = self._filled_long()
+            if long_q <= tol:
+                return
+            px = self._aggressive_limit_price(Side.SELL, book)
+            self.order_e = self._place(
+                self.acc1, Side.SELL, px, long_q, tag="E", post_only=False, reduce_only=False
+            )
+            logger.info("5TH E: sell close long size=%s @ %s", long_q, px)
+            self.last_reprice = time.time()
+            self.reprice_count += 1
+
+    def _reprice_fifth_if_needed(self) -> None:
+        if not self.emergency_active:
+            return
+        if time.time() - self.last_reprice < self.cfg.strategy.reprice_sec:
+            return
+        # Still one-sided? re-run 5th path (cancel + new book price)
+        if not self._both_flat() and (self._acc1_flat() ^ self._acc2_flat()):
+            self._maybe_fifth_order()
+
+    def _reprice_entry_imbalance(self) -> None:
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        need_long = self.target_size - long_q
+        need_short = self.target_size - short_q
+        logger.info("ENTRY reprice long=%s short=%s needL=%s needS=%s", long_q, short_q, need_long, need_short)
+
+        max_rep = self.cfg.strategy.max_reprice_attempts
+        if max_rep and self.reprice_count >= max_rep:
+            return
+
+        book = self._book()
+        maker = self._want_maker()
         self.reprice_count += 1
         self.stats.reprice_count = self.reprice_count
 
@@ -292,15 +393,23 @@ class DeltaNeutralEngine:
             if self.order_a and self.order_a.is_open:
                 self.order_a = self._safe_cancel(self.acc1, self.order_a)
                 self.order_a = self._wait_cancel_settled(self.acc1, self.order_a)
-            # Re-read after cancel race
             long_q = self._filled_long()
             need_long = self.target_size - long_q
             if need_long > self._tol():
-                px = self._price_for_side(Side.BUY, book)
-                logger.info("Reprice A: buy residual %s @ %s", need_long, px)
-                self.order_a = self._place_limit(
-                    self.acc1, Side.BUY, px, need_long, reduce_only=False, tag="A"
+                px = self._maker_price(Side.BUY, book) if maker else self._aggressive_limit_price(Side.BUY, book)
+                self.order_a = self._place(
+                    self.acc1, Side.BUY, px, need_long, tag="A", post_only=maker, reduce_only=False
                 )
+                if self.order_a is None and maker:
+                    self.order_a = self._place(
+                        self.acc1,
+                        Side.BUY,
+                        self._aggressive_limit_price(Side.BUY, book),
+                        need_long,
+                        tag="A",
+                        post_only=False,
+                        reduce_only=False,
+                    )
 
         if need_short > self._tol():
             if self.order_c and self.order_c.is_open:
@@ -309,210 +418,208 @@ class DeltaNeutralEngine:
             short_q = self._filled_short()
             need_short = self.target_size - short_q
             if need_short > self._tol():
-                px = self._price_for_side(Side.SELL, book)
-                logger.info("Reprice C: sell residual %s @ %s", need_short, px)
-                self.order_c = self._place_limit(
-                    self.acc2, Side.SELL, px, need_short, reduce_only=False, tag="C"
+                px = self._maker_price(Side.SELL, book) if maker else self._aggressive_limit_price(Side.SELL, book)
+                self.order_c = self._place(
+                    self.acc2, Side.SELL, px, need_short, tag="C", post_only=maker, reduce_only=False
                 )
+                if self.order_c is None and maker:
+                    self.order_c = self._place(
+                        self.acc2,
+                        Side.SELL,
+                        self._aggressive_limit_price(Side.SELL, book),
+                        need_short,
+                        tag="C",
+                        post_only=False,
+                        reduce_only=False,
+                    )
 
         self.last_reprice = time.time()
 
-    def _sync_target_to_min_fill(self) -> None:
-        """After both sides have something, shrink target to min filled so we don't chase forever."""
-        long_q = self._filled_long()
-        short_q = self._filled_short()
-        if long_q > self._tol() and short_q > self._tol():
-            m = min(long_q, short_q)
-            # If one is ahead, the lagging will catch up to original target;
-            # once min is close to max within tolerance we're balanced.
-            _ = m
-
-    def _on_entry_balanced(self) -> None:
-        long_q = self._filled_long()
-        short_q = self._filled_short()
-        # Equalize: if one side overshot, reduce target to the smaller fill
-        balanced_size = min(long_q, short_q)
-        if abs(long_q - short_q) > self._tol():
-            # Still imbalanced — shouldn't be called
+    def _ensure_bd_resting(self) -> None:
+        """Keep B/D at close_price while BOTH sides still have positions."""
+        if self.emergency_active:
             return
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        if long_q <= self._tol() or short_q <= self._tol():
+            return  # one side done → 5th order path owns closes
+        if self.close_price <= 0:
+            self.close_price = self._close_price_from_entry(self.entry_ref or self._book().mid)
 
-        self.target_size = balanced_size
+        book = self._book()
+        mark = book.mark_price if book.mark_price > 0 else book.mid
+        maker = self._want_maker()
+
+        self.order_b = self._refresh_order(self.acc1, self.order_b)
+        self.order_d = self._refresh_order(self.acc2, self.order_d)
+
+        if long_q > self._tol() and (not self.order_b or self.order_b.is_terminal):
+            b_post = maker and self.close_price >= mark
+            self.order_b = self._place(
+                self.acc1,
+                Side.SELL,
+                self.close_price,
+                long_q,
+                tag="B",
+                post_only=b_post,
+                reduce_only=False,
+            )
+
+        if short_q > self._tol() and (not self.order_d or self.order_d.is_terminal):
+            if self.close_price > mark:
+                self.order_d = self._place(
+                    self.acc2,
+                    Side.BUY,
+                    self.close_price,
+                    short_q,
+                    tag="D",
+                    post_only=True,
+                    reduce_only=False,
+                )
+            else:
+                self.order_d = self._place(
+                    self.acc2,
+                    Side.BUY,
+                    self.close_price,
+                    short_q,
+                    tag="D",
+                    post_only=maker,
+                    reduce_only=False,
+                )
+
+    # ── cycle ─────────────────────────────────────────────────────────
+
+    def _start_cycle(self) -> bool:
+        self.cycle += 1
+        self.market = self._next_market()
+        self.stats = CycleStats(cycle_id=self.cycle, market=self.market)
+        self.order_a = self.order_b = self.order_c = self.order_d = self.order_e = None
+        self.reprice_count = 0
+        self.emergency_active = False
+        self.close_price = Decimal("0")
+
+        logger.info("========== CYCLE %s | %s ==========", self.cycle, self.market)
+
+        self.info = self.acc1.get_market_info(self.market)
+        lev = min(self.cfg.leverage, self.cfg.max_leverage_for(self.market), self.info.max_leverage)
+        self.acc1.set_leverage(self.market, lev)
+        self.acc2.set_leverage(self.market, lev)
+
+        self.acc1.cancel_open_bot_orders(self.market)
+        self.acc2.cancel_open_bot_orders(self.market)
+
+        if not self._both_flat():
+            long_q = self._filled_long()
+            short_q = self._filled_short()
+            logger.warning("Residual long=%s short=%s", long_q, short_q)
+            if abs(long_q - short_q) <= self._tol() and long_q > self._tol():
+                p1 = self.acc1.get_position(self.market)
+                p2 = self.acc2.get_position(self.market)
+                e1 = p1.average_entry_price if p1 else self._book().mid
+                e2 = p2.average_entry_price if p2 else e1
+                self.entry_ref = (e1 + e2) / 2
+                self.target_size = min(long_q, short_q)
+                self.close_price = self._close_price_from_entry(self.entry_ref)
+                self._ensure_bd_resting()
+                self.stage = Stage.EXIT
+                self.stage_started = time.time()
+                self.last_reprice = time.time()
+                return True
+            # One-sided residual → 5th path immediately
+            self.stage = Stage.EXIT
+            self.emergency_active = True
+            self.last_reprice = 0.0
+            self._maybe_fifth_order()
+            return True
+
+        bal1 = self.acc1.get_balance()
+        bal2 = self.acc2.get_balance()
+        if self.cfg.risk.stop_on_liquidation and (bal1.under_liquidation or bal2.under_liquidation):
+            logger.error("Under liquidation — stop")
+            self.stage = Stage.STOPPED
+            self._stop = True
+            return False
+
+        book = self._book()
+        size, ref, note = compute_equal_size(self.cfg, self.market, self.info, book, bal1, bal2)
+        logger.info("Sizing: %s", note)
+        ok, size, liq_msg = check_liq_buffer(self.cfg, ref, lev, size, self.info)
+        logger.info("Liq: %s", liq_msg)
+        if not ok or size <= 0:
+            self.stage = Stage.IDLE
+            self._sleep(self.cfg.strategy.cycle_pause_sec)
+            return False
+
+        self.target_size = size
+        self.stats.target_size = size
+        entry_px = self._same_entry_price(book)
+        self._place_abcd(entry_px, size)
+
+        self.stage = Stage.ENTRY
+        self.stage_started = time.time()
+        self.last_reprice = time.time()
+        return True
+
+    def _on_hedge_open(self) -> None:
+        long_q = self._filled_long()
+        short_q = self._filled_short()
+        self.target_size = min(long_q, short_q)
         p1 = self.acc1.get_position(self.market)
         p2 = self.acc2.get_position(self.market)
         e1 = p1.average_entry_price if p1 else self.entry_ref
         e2 = p2.average_entry_price if p2 else self.entry_ref
         self.entry_ref = (e1 + e2) / 2
         self.stats.entry_price = self.entry_ref
+        # Keep original close target if already set; else recompute from fill entry
+        if self.close_price <= 0:
+            self.close_price = self._close_price_from_entry(self.entry_ref)
 
-        ok1, msg1 = post_fill_liq_ok(self.cfg, self.acc1, self.market, e1)
-        ok2, msg2 = post_fill_liq_ok(self.cfg, self.acc2, self.market, e2)
-        logger.info("Post-fill liq: acc1 %s | acc2 %s", msg1, msg2)
-        if not (ok1 and ok2):
-            logger.warning("Liq buffer fail after fill — still proceeding to manage close (manual risk)")
+        ok1, m1 = post_fill_liq_ok(self.cfg, self.acc1, self.market, e1)
+        ok2, m2 = post_fill_liq_ok(self.cfg, self.acc2, self.market, e2)
+        logger.info(
+            "HEDGE OPEN size=%s entry≈%s B/D close@%s | %s | %s",
+            self.target_size,
+            self.entry_ref,
+            self.close_price,
+            m1,
+            m2,
+        )
 
-        direction = self.cfg.strategy.close_direction
-        pct = Decimal(str(self.cfg.strategy.close_price_pct)) / Decimal("100")
+        # Cancel leftover entry if any; B/D already placed with A/C
+        if self.order_a and self.order_a.is_open:
+            self.order_a = self._safe_cancel(self.acc1, self.order_a)
+        if self.order_c and self.order_c.is_open:
+            self.order_c = self._safe_cancel(self.acc2, self.order_c)
 
-        if direction == "up":
-            self.close_price = quantize_down(
-                self.entry_ref * (Decimal("1") + pct), self.info.quote_increment  # type: ignore[union-attr]
-            )
-            self._place_close_orders()
-        elif direction == "down":
-            self.close_price = quantize_down(
-                self.entry_ref * (Decimal("1") - pct), self.info.quote_increment  # type: ignore[union-attr]
-            )
-            self._place_close_orders()
-        else:
-            # either: wait for ±1% mark move then place B+D at same book price
-            logger.info(
-                "ENTRY hedged size=%s entry≈%s — waiting for ±%s%% mark move before B+D",
-                balanced_size,
-                self.entry_ref,
-                self.cfg.strategy.close_price_pct,
-            )
-            self.stage = Stage.WAIT_CLOSE_TRIGGER
-            self.stage_started = time.time()
-
-    def _place_close_orders(self) -> None:
-        """B + D reduce-only at the same close_price."""
-        size = min(self._filled_long(), self._filled_short())
-        if size <= self._tol():
-            logger.info("Nothing to close")
-            self.stage = Stage.IDLE
-            return
-
-        # Cancel any leftover entry orders
-        self.order_a = self._safe_cancel(self.acc1, self.order_a)
-        self.order_c = self._safe_cancel(self.acc2, self.order_c)
-
-        px = self.close_price
-        if px <= 0:
-            book = self._book()
-            px = self._same_entry_price(book)
-
-        logger.info("EXIT: B sell + D buy size=%s @ %s (reduce-only)", size, px)
-        self.order_b = self._place_limit(self.acc1, Side.SELL, px, size, reduce_only=True, tag="B")
-        self.order_d = self._place_limit(self.acc2, Side.BUY, px, size, reduce_only=True, tag="D")
+        self._ensure_bd_resting()
         self.stage = Stage.EXIT
         self.stage_started = time.time()
         self.last_reprice = time.time()
-        self.reprice_count = 0
-
-    def _check_close_trigger(self) -> None:
-        book = self._book()
-        mark = book.mark_price if book.mark_price > 0 else book.mid
-        if self.entry_ref <= 0:
-            return
-        # Dry-run: mark does not move — auto-fire close after short wait
-        if self.cfg.bot.dry_run and time.time() - self.stage_started >= 1.0:
-            mark = self.entry_ref * (Decimal("1") + Decimal(str(self.cfg.strategy.close_price_pct)) / Decimal("100"))
-            logger.info("DRY_RUN: simulating +%s%% mark move → %s", self.cfg.strategy.close_price_pct, mark)
-        move = abs(mark - self.entry_ref) / self.entry_ref * Decimal("100")
-        need = Decimal(str(self.cfg.strategy.close_price_pct))
-        if move + Decimal("0.0001") >= need:
-            # Place both closes at same aggressive book-aligned price for fast fill
-            if mark >= self.entry_ref:
-                # price up: sell long at bid/ask, buy short cover at same level
-                px = self._price_for_side(Side.SELL, book)
-            else:
-                px = self._price_for_side(Side.BUY, book)
-            # Force identical price for B and D
-            self.close_price = quantize_down(px, self.info.quote_increment)  # type: ignore[union-attr]
-            logger.info("Close trigger: mark=%s move=%.4f%% → B/D @ %s", mark, float(move), self.close_price)
-            self._place_close_orders()
-
-    def _reprice_exit_imbalance(self) -> None:
-        long_q = self._filled_long()
-        short_q = self._filled_short()
-        logger.info("EXIT reconcile remaining long=%s short=%s", long_q, short_q)
-
-        self.order_b = self._refresh_order(self.acc1, self.order_b)
-        self.order_d = self._refresh_order(self.acc2, self.order_d)
-
-        max_rep = self.cfg.strategy.max_reprice_attempts
-        if max_rep and self.reprice_count >= max_rep:
-            logger.warning("Max reprice attempts reached in EXIT")
-            return
-
-        book = self._book()
-        self.reprice_count += 1
-        self.stats.reprice_count = self.reprice_count
-
-        # Remaining to close = current position
-        if long_q > self._tol():
-            if self.order_b and self.order_b.is_open:
-                self.order_b = self._safe_cancel(self.acc1, self.order_b)
-                self.order_b = self._wait_cancel_settled(self.acc1, self.order_b)
-            long_q = self._filled_long()
-            if long_q > self._tol():
-                px = self._price_for_side(Side.SELL, book)
-                logger.info("Reprice B: sell residual %s @ %s", long_q, px)
-                self.order_b = self._place_limit(
-                    self.acc1, Side.SELL, px, long_q, reduce_only=True, tag="B"
-                )
-
-        if short_q > self._tol():
-            if self.order_d and self.order_d.is_open:
-                self.order_d = self._safe_cancel(self.acc2, self.order_d)
-                self.order_d = self._wait_cancel_settled(self.acc2, self.order_d)
-            short_q = self._filled_short()
-            if short_q > self._tol():
-                px = self._price_for_side(Side.BUY, book)
-                logger.info("Reprice D: buy residual %s @ %s", short_q, px)
-                self.order_d = self._place_limit(
-                    self.acc2, Side.BUY, px, short_q, reduce_only=True, tag="D"
-                )
-
-        self.last_reprice = time.time()
-
-    def _reconcile_residual(self) -> None:
-        """Emergency: flatten whatever is open with reprice loop."""
-        logger.warning("RECONCILE residual exposure")
-        self.market = self.market or self.cfg.markets[0]
-        if not self.info:
-            self.info = self.acc1.get_market_info(self.market)
-        # Treat as exit until flat
-        if self._both_flat():
-            self.stage = Stage.IDLE
-            return
-        self._reprice_exit_imbalance()
-        if self._both_flat():
-            self.stage = Stage.IDLE
-
-    # ── main loop ─────────────────────────────────────────────────────
 
     def run(self) -> None:
         logger.info(
-            "Bot start | markets=%s lev=%s margin=%s%% close=%s%% mode=%s dry_run=%s",
-            self.cfg.markets,
-            self.cfg.leverage,
-            self.cfg.sizing.margin_usage_pct,
+            "Bot start | A+C same price/size opposite | B+D with them @ ±%s%% | "
+            "no TP/SL | 5th order only if one acc flat other not | maker=%s dry=%s",
             self.cfg.strategy.close_price_pct,
-            self.cfg.strategy.order_mode,
+            self._want_maker(),
             self.cfg.bot.dry_run,
         )
-        if self.cfg.bot.dry_run:
-            logger.warning("DRY_RUN enabled — no real orders (simulated fills)")
 
         while not self._stop:
             try:
-                if self.cfg.bot.max_cycles and self.cycle >= self.cfg.bot.max_cycles and self.stage == Stage.IDLE:
-                    logger.info("max_cycles reached — exit")
+                if (
+                    self.cfg.bot.max_cycles
+                    and self.cycle >= self.cfg.bot.max_cycles
+                    and self.stage == Stage.IDLE
+                ):
+                    logger.info("max_cycles reached")
                     break
-
                 if self.stage == Stage.STOPPED:
                     break
 
                 if self.stage == Stage.IDLE:
-                    started = self._start_cycle()
-                    if not started and self.stage == Stage.IDLE:
+                    if not self._start_cycle() and self.stage == Stage.IDLE:
                         self._sleep(self.cfg.strategy.cycle_pause_sec)
-                    continue
-
-                if self.stage == Stage.RECONCILE:
-                    self._reconcile_residual()
-                    self._sleep(self.cfg.strategy.reprice_sec)
                     continue
 
                 if self.stage == Stage.ENTRY:
@@ -521,62 +628,69 @@ class DeltaNeutralEngine:
                     long_q = self._filled_long()
                     short_q = self._filled_short()
 
-                    # Matched target (both fully filled to target or equal partial)
+                    # One account already closed while other open during entry? rare
+                    if (long_q <= self._tol()) ^ (short_q <= self._tol()):
+                        if long_q > self._tol() or short_q > self._tol():
+                            self.stage = Stage.EXIT
+                            self._maybe_fifth_order()
+                            continue
+
                     if long_q >= self.target_size - self._tol() and short_q >= self.target_size - self._tol():
-                        # trim target to actual min
-                        self.target_size = min(long_q, short_q)
-                        logger.info("ENTRY complete long=%s short=%s", long_q, short_q)
-                        self._on_entry_balanced()
+                        self._on_hedge_open()
                     elif abs(long_q - short_q) <= self._tol() and long_q > self._tol():
-                        # Equal partial fills — accept smaller hedge and move on
-                        # only if both orders terminal or timeout on reprice
                         a_done = not self.order_a or self.order_a.is_terminal
                         c_done = not self.order_c or self.order_c.is_terminal
                         if a_done and c_done:
-                            self.target_size = min(long_q, short_q)
-                            logger.info("ENTRY equal partial accepted size=%s", self.target_size)
-                            self._on_entry_balanced()
+                            self._on_hedge_open()
                         elif time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec:
                             self._reprice_entry_imbalance()
-                    else:
-                        # Imbalance or still waiting
-                        if time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec:
-                            self._reprice_entry_imbalance()
-                    self._sleep(self.cfg.strategy.poll_interval_sec)
-                    continue
-
-                if self.stage == Stage.WAIT_CLOSE_TRIGGER:
-                    self._check_close_trigger()
+                    elif time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec:
+                        self._reprice_entry_imbalance()
                     self._sleep(self.cfg.strategy.poll_interval_sec)
                     continue
 
                 if self.stage == Stage.EXIT:
                     self.order_b = self._refresh_order(self.acc1, self.order_b)
                     self.order_d = self._refresh_order(self.acc2, self.order_d)
+                    self.order_e = self._refresh_order(
+                        self.acc1 if self._filled_long() > self._tol() else self.acc2,
+                        self.order_e,
+                    )
+
                     if self._both_flat():
                         logger.info(
-                            "CYCLE %s complete | market=%s entry=%s reprices=%s",
+                            "CYCLE %s done | entry=%s close=%s 5th_used=%s reprices=%s",
                             self.cycle,
-                            self.market,
                             self.stats.entry_price,
+                            self.close_price,
+                            self.emergency_active,
                             self.stats.reprice_count,
                         )
                         self.stage = Stage.IDLE
                         self._sleep(self.cfg.strategy.cycle_pause_sec)
-                    elif time.time() - self.last_reprice >= self.cfg.strategy.reprice_sec:
-                        self._reprice_exit_imbalance()
+                        continue
+
+                    # Core rule: one account fully closed, other not → 5th order only then
+                    if self._acc1_flat() ^ self._acc2_flat():
+                        if not self.emergency_active:
+                            self._maybe_fifth_order()
+                        else:
+                            self._reprice_fifth_if_needed()
+                    else:
+                        # Both still open — leave B/D at 1%; refresh if missing
+                        self.emergency_active = False
+                        self._ensure_bd_resting()
+
                     self._sleep(self.cfg.strategy.poll_interval_sec)
                     continue
 
                 self._sleep(self.cfg.strategy.poll_interval_sec)
             except KeyboardInterrupt:
-                logger.info("Interrupted — stopping")
                 self._stop = True
             except Exception:
-                logger.exception("Loop error — backoff 2s")
+                logger.exception("Loop error")
                 self._sleep(2.0)
 
-        # Best-effort cancel open bot orders on shutdown
         try:
             if self.market:
                 self.acc1.cancel_open_bot_orders(self.market)
