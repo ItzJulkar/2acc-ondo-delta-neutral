@@ -255,13 +255,18 @@ class DeltaNeutralEngine:
             close_px,
         )
 
+        # Prefer same mid; if either rejects, both join bid/ask as maker (safer pair)
         self.order_a = self._place(self.acc1, Side.BUY, entry_px, size, tag="A")
         self.order_c = self._place(self.acc2, Side.SELL, entry_px, size, tag="C")
-        if self.order_a is None:
+        if self.order_a is None or self.order_c is None:
+            if self._is_open(self.order_a):
+                self.order_a = self._safe_cancel(self.acc1, self.order_a)
+            if self._is_open(self.order_c):
+                self.order_c = self._safe_cancel(self.acc2, self.order_c)
+            book = self._book()
             self.order_a = self._place(
                 self.acc1, Side.BUY, self._maker_price(Side.BUY, book), size, tag="A"
             )
-        if self.order_c is None:
             self.order_c = self._place(
                 self.acc2, Side.SELL, self._maker_price(Side.SELL, book), size, tag="C"
             )
@@ -273,8 +278,9 @@ class DeltaNeutralEngine:
         self.emergency_active = False
         self.dual_book_close_active = False
         self._bd_placed = False
+        self._naked_abort_at = 0.0
         logger.info(
-            "[%s] Live ENTRY only A=%s C=%s (B/D deferred)",
+            "[%s] Live ENTRY only A=%s C=%s (B/D deferred until BOTH filled)",
             self.market,
             getattr(self.order_a, "order_id", None),
             getattr(self.order_c, "order_id", None),
@@ -384,13 +390,13 @@ class DeltaNeutralEngine:
                 need = self.target_size - long_q
                 logger.info("A missing/dead — re-place once @ %s size=%s", entry_px, need)
                 self.order_a = self._place(
-                    self.acc1, Side.BUY, entry_px, need, tag="A", post_only=True
+                    self.acc1, Side.BUY, entry_px, need, tag="A"
                 )
             if not self._is_open(self.order_c) and short_q < self.target_size - tol:
                 need = self.target_size - short_q
                 logger.info("C missing/dead — re-place once @ %s size=%s", entry_px, need)
                 self.order_c = self._place(
-                    self.acc2, Side.SELL, entry_px, need, tag="C", post_only=True
+                    self.acc2, Side.SELL, entry_px, need, tag="C"
                 )
             self.last_reprice = time.time()
             return
