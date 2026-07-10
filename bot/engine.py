@@ -249,43 +249,92 @@ class DeltaNeutralEngine:
             self.acc2, Side.SELL, entry_px, size, tag="C", post_only=True, reduce_only=False
         )
 
-        # B: sell close @ +1% — rests above market (GTC, not reduce-only)
+        # B: sell @ close_px — above market, rests as open limit
         self.order_b = self._place(
             self.acc1, Side.SELL, close_px, size, tag="B", post_only=False, reduce_only=False
         )
 
-        # D: LIMIT buy @ same close_px as B. NO stop-loss / NO take-profit / NO set_stop_order.
-        # Buy above mark cannot rest (would take now). We still submit post-only limit at close_px;
-        # if rejected, D stays unset until 5th-order path places a LIMIT at the book (still no SL).
-        self.order_d = self._place(
+        # D: MUST be an open LIMIT on acc2 (no TP/SL).
+        # Buy at close_px above the ask cannot rest (post-only reject / would take).
+        # Place D at highest post-only-safe buy (min(close_px, best_ask - tick)) so it is OPEN.
+        # When price reaches target with both still open → dual-book; if only one side done → E.
+        self.order_d = self._place_d_resting_limit(size, close_px)
+
+        self.order_e = None
+        self.emergency_active = False
+        self.dual_book_close_active = False
+        self._bd_placed = True
+        logger.info(
+            "Live orders A=%s B=%s C=%s D=%s — waiting for fills",
+            getattr(self.order_a, "order_id", None),
+            getattr(self.order_b, "order_id", None),
+            getattr(self.order_c, "order_id", None),
+            getattr(self.order_d, "order_id", None),
+        )
+
+    def _max_resting_buy_px(self, book: BookTop) -> Decimal:
+        """Highest buy price that can rest as maker (must stay below best ask)."""
+        assert self.info is not None
+        tick = self.info.quote_increment
+        if book.best_ask > tick:
+            return quantize_down(book.best_ask - tick, tick)
+        if book.best_bid > 0:
+            return quantize_down(book.best_bid, tick)
+        return quantize_down(book.mid, tick)
+
+    def _place_d_resting_limit(self, size: Decimal, close_px: Decimal) -> Optional[Order]:
+        """
+        Always try to leave an OPEN D limit on acc2.
+        Prefer exact close_px when it can rest; else park at best_ask - tick (still open).
+        """
+        if size <= self._tol():
+            return None
+        book = self._book()
+        max_rest = self._max_resting_buy_px(book)
+        # Use target if it won't cross the ask; else park just under ask so order is OPEN
+        d_px = close_px if close_px <= max_rest else max_rest
+        if d_px <= 0:
+            d_px = book.best_bid if book.best_bid > 0 else book.mid
+            d_px = quantize_down(d_px, self.info.quote_increment)  # type: ignore[union-attr]
+
+        o = self._place(
             self.acc2,
             Side.BUY,
-            close_px,
+            d_px,
             size,
             tag="D",
             post_only=True,
             reduce_only=False,
             allow_taker_fallback=False,
         )
-        if self.order_d:
-            logger.info("D LIMIT placed @ %s id=%s", close_px, self.order_d.order_id)
-        else:
-            logger.info(
-                "D LIMIT post-only rejected @ %s (buy above mark cannot rest). "
-                "No SL will be used. 5th LIMIT will close Acc2 only if Acc1 goes flat first.",
-                close_px,
+        if o is None:
+            # Join bid as last resort (still open limit, no SL)
+            bid = book.best_bid if book.best_bid > 0 else d_px
+            o = self._place(
+                self.acc2,
+                Side.BUY,
+                bid,
+                size,
+                tag="D",
+                post_only=True,
+                reduce_only=False,
+                allow_taker_fallback=False,
             )
+            d_px = bid
 
-        self.order_e = None
-        self.emergency_active = False
-        self._bd_placed = True
-        logger.info(
-            "Live orders A=%s B=%s C=%s D=%s — waiting for fills (no auto-cancel timer)",
-            getattr(self.order_a, "order_id", None),
-            getattr(self.order_b, "order_id", None),
-            getattr(self.order_c, "order_id", None),
-            getattr(self.order_d, "order_id", None),
-        )
+        if o:
+            if d_px < close_px:
+                logger.info(
+                    "D OPEN limit @ %s (parked under ask; target close=%s). "
+                    "Will dual-book both sides if still open after target.",
+                    d_px,
+                    close_px,
+                )
+            else:
+                logger.info("D OPEN limit @ %s (at target) id=%s", d_px, o.order_id)
+        else:
+            logger.error("D failed to place any resting limit — check acc2 balance/API")
+        return o
 
     # ── ENTRY: reprice ONLY on true one-sided fill ────────────────────
 
@@ -399,16 +448,7 @@ class DeltaNeutralEngine:
 
         if short_q > self._tol() and not self._is_open(self.order_d):
             if self.order_d is None or self.order_d.is_terminal:
-                # LIMIT only, never SL. Only place if it can rest (close <= mark) or try post-only.
-                self.order_d = self._place(
-                    self.acc2,
-                    Side.BUY,
-                    self.close_price,
-                    short_q,
-                    tag="D",
-                    post_only=True,
-                    allow_taker_fallback=False,
-                )
+                self.order_d = self._place_d_resting_limit(short_q, self.close_price)
 
     # ── Dual book close: BOTH B+D stuck after target move (NOT E) ─────
 
