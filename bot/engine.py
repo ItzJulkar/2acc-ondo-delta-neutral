@@ -241,25 +241,26 @@ class DeltaNeutralEngine:
             self.acc1, Side.SELL, close_px, size, tag="B", post_only=False, reduce_only=False
         )
 
-        # D: buy close @ same price as B.
-        # Buy limit ABOVE the market is immediately marketable — it cannot REST.
-        #   post-only → exchange rejects (would take)
-        #   plain GTC → fills NOW at ~mark (closes short early / wrong) — DO NOT do this
-        # So when close_px > mark we do NOT place a resting D. When Acc1 later closes via B
-        # (price reached +1%), the 5th-order path places D/E at the book to close Acc2.
-        # When close_px <= mark (price already up), D can rest/join as post-only or GTC.
-        if close_px > mark:
-            self.order_d = None
-            logger.info(
-                "D NOT placed yet: buy limit @ %s is ABOVE mark %s so it cannot rest on the book "
-                "(B sell @ %s CAN rest). D/E will place when price is near close or Acc1 goes flat.",
-                close_px,
-                mark,
-                close_px,
-            )
+        # D: LIMIT buy @ same close_px as B. NO stop-loss / NO take-profit / NO set_stop_order.
+        # Buy above mark cannot rest (would take now). We still submit post-only limit at close_px;
+        # if rejected, D stays unset until 5th-order path places a LIMIT at the book (still no SL).
+        self.order_d = self._place(
+            self.acc2,
+            Side.BUY,
+            close_px,
+            size,
+            tag="D",
+            post_only=True,
+            reduce_only=False,
+            allow_taker_fallback=False,
+        )
+        if self.order_d:
+            logger.info("D LIMIT placed @ %s id=%s", close_px, self.order_d.order_id)
         else:
-            self.order_d = self._place(
-                self.acc2, Side.BUY, close_px, size, tag="D", post_only=True, reduce_only=False
+            logger.info(
+                "D LIMIT post-only rejected @ %s (buy above mark cannot rest). "
+                "No SL will be used. 5th LIMIT will close Acc2 only if Acc1 goes flat first.",
+                close_px,
             )
 
         self.order_e = None
@@ -384,14 +385,17 @@ class DeltaNeutralEngine:
                 )
 
         if short_q > self._tol() and not self._is_open(self.order_d):
-            if self.order_d is None or (self.order_d.is_terminal and self.order_d.status != OrderStatus.FULLY_FILLED):
-                # Only place resting D if close is at/below mark (otherwise wait for 5th path)
-                if self.close_price <= mark:
-                    logger.info("D missing — place once buy @ %s size=%s", self.close_price, short_q)
-                    self.order_d = self._place(
-                        self.acc2, Side.BUY, self.close_price, short_q, tag="D", post_only=True
-                    )
-                # else: silent wait — do not spam logs
+            if self.order_d is None or self.order_d.is_terminal:
+                # LIMIT only, never SL. Only place if it can rest (close <= mark) or try post-only.
+                self.order_d = self._place(
+                    self.acc2,
+                    Side.BUY,
+                    self.close_price,
+                    short_q,
+                    tag="D",
+                    post_only=True,
+                    allow_taker_fallback=False,
+                )
 
     # ── 5th order only ────────────────────────────────────────────────
 
@@ -484,6 +488,9 @@ class DeltaNeutralEngine:
         self.acc2.set_leverage(self.market, lev)
         self.acc1.cancel_open_bot_orders(self.market)
         self.acc2.cancel_open_bot_orders(self.market)
+        # Never use exchange TP/SL — clear any leftovers
+        self.acc1.remove_all_stops(self.market)
+        self.acc2.remove_all_stops(self.market)
 
         if not self._both_flat():
             long_q = self._filled_long()
