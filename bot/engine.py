@@ -102,14 +102,25 @@ class DeltaNeutralEngine:
         mid = book.mid if book.mid > 0 else book.mark_price
         return quantize_down(mid, self.info.quote_increment)
 
-    def _aggressive_price(self, side: Side, book: BookTop) -> Decimal:
+    def _maker_price(self, side: Side, book: BookTop) -> Decimal:
+        """
+        Join the book as maker only (never cross the spread).
+        BUY  → best bid (or bid - offset ticks)
+        SELL → best ask (or ask + offset ticks)
+        """
         assert self.info is not None
         tick = self.info.quote_increment
+        offset = Decimal(self.cfg.strategy.book_offset_ticks) * tick
         if side == Side.BUY:
-            px = book.best_ask if book.best_ask > 0 else book.mid
+            base = book.best_bid if book.best_bid > 0 else book.mid
+            px = base - offset
         else:
-            px = book.best_bid if book.best_bid > 0 else book.mid
-        return quantize_down(px, tick)
+            base = book.best_ask if book.best_ask > 0 else book.mid
+            px = base + offset
+        px = quantize_down(px, tick)
+        if px <= 0:
+            px = quantize_down(book.mid, tick)
+        return px
 
     def _close_price_from_entry(self, entry: Decimal) -> Decimal:
         """
@@ -186,10 +197,8 @@ class DeltaNeutralEngine:
         size: Decimal,
         *,
         tag: str,
-        post_only: bool = False,
-        reduce_only: bool = False,
-        allow_taker_fallback: bool = True,
     ) -> Optional[Order]:
+        """Always post-only maker. Never reduce-only IOC. Never taker fallback."""
         if size <= self._tol():
             return None
         assert self.info is not None
@@ -203,34 +212,19 @@ class DeltaNeutralEngine:
                 side,
                 price,
                 size,
-                reduce_only=reduce_only,
-                post_only=post_only,
+                reduce_only=False,
+                post_only=True,
                 tag=tag,
             )
         except OndoAPIError as exc:
-            if exc.code == "post_only_has_match" and post_only:
-                if not allow_taker_fallback:
-                    logger.warning(
-                        "[%s] %s post-only rejected @ %s — no taker fallback (would fill now)",
-                        client.name,
-                        tag,
-                        price,
-                    )
-                    return None
-                logger.warning("[%s] %s post-only rejected @ %s — retry plain GTC", client.name, tag, price)
-                try:
-                    return client.place_limit(
-                        self.market,
-                        side,
-                        price,
-                        size,
-                        reduce_only=reduce_only,
-                        post_only=False,
-                        tag=tag,
-                    )
-                except OndoAPIError as exc2:
-                    logger.error("[%s] place %s failed: %s", client.name, tag, exc2)
-                    return None
+            if exc.code == "post_only_has_match":
+                logger.warning(
+                    "[%s] %s MAKER rejected @ %s (would take) — will reprice later, no taker",
+                    client.name,
+                    tag,
+                    price,
+                )
+                return None
             logger.error("[%s] place %s failed: %s", client.name, tag, exc)
             return None
 
@@ -254,23 +248,27 @@ class DeltaNeutralEngine:
             self.cfg.strategy.close_price_pct,
         )
 
-        # A + C: same current book mid (GTC). Prefer post-only; fallback plain GTC.
-        self.order_a = self._place(
-            self.acc1, Side.BUY, entry_px, size, tag="A", post_only=True, reduce_only=False
-        )
-        self.order_c = self._place(
-            self.acc2, Side.SELL, entry_px, size, tag="C", post_only=True, reduce_only=False
-        )
+        # A + C: same mid, MAKER only (post-only). If rejected, reprice later as maker.
+        self.order_a = self._place(self.acc1, Side.BUY, entry_px, size, tag="A")
+        self.order_c = self._place(self.acc2, Side.SELL, entry_px, size, tag="C")
+        if self.order_a is None:
+            # Join bid as maker so Acc1 still has an open A
+            self.order_a = self._place(
+                self.acc1, Side.BUY, self._maker_price(Side.BUY, book), size, tag="A"
+            )
+        if self.order_c is None:
+            self.order_c = self._place(
+                self.acc2, Side.SELL, self._maker_price(Side.SELL, book), size, tag="C"
+            )
 
-        # B: sell @ close_px — above market, rests as open limit
-        self.order_b = self._place(
-            self.acc1, Side.SELL, close_px, size, tag="B", post_only=False, reduce_only=False
-        )
+        # B: sell @ close_px — above market → maker if post-only
+        self.order_b = self._place(self.acc1, Side.SELL, close_px, size, tag="B")
+        if self.order_b is None:
+            self.order_b = self._place(
+                self.acc1, Side.SELL, self._maker_price(Side.SELL, book), size, tag="B"
+            )
 
-        # D: MUST be an open LIMIT on acc2 (no TP/SL).
-        # Buy at close_px above the ask cannot rest (post-only reject / would take).
-        # Place D at highest post-only-safe buy (min(close_px, best_ask - tick)) so it is OPEN.
-        # When price reaches target with both still open → dual-book; if only one side done → E.
+        # D: maker buy that stays OPEN (park under bid if target would take)
         self.order_d = self._place_d_resting_limit(size, close_px)
 
         self.order_e = None
@@ -320,27 +318,11 @@ class DeltaNeutralEngine:
                 d_px = close_px
             parked = True
 
-        o = self._place(
-            self.acc2,
-            Side.BUY,
-            d_px,
-            size,
-            tag="D",
-            post_only=True,
-            reduce_only=False,
-            allow_taker_fallback=False,
-        )
+        o = self._place(self.acc2, Side.BUY, d_px, size, tag="D")
         if o is None and parked:
-            # Fallback: join bid
+            # Fallback: join bid as maker
             o = self._place(
-                self.acc2,
-                Side.BUY,
-                quantize_down(best_bid, tick),
-                size,
-                tag="D",
-                post_only=True,
-                reduce_only=False,
-                allow_taker_fallback=False,
+                self.acc2, Side.BUY, quantize_down(best_bid, tick), size, tag="D"
             )
             if o:
                 d_px = quantize_down(best_bid, tick)
@@ -400,12 +382,11 @@ class DeltaNeutralEngine:
         self.stats.reprice_count = self.reprice_count
 
         if long_q > tol and short_q < self.target_size - tol:
-            # Acc1 filled (or partial), Acc2 lagging → cancel/reprice only C
+            # Acc1 filled, Acc2 lagging → reprice C only as MAKER (join ask)
             need = self.target_size - short_q
-            # Match current book for lagging side
-            px = self._aggressive_price(Side.SELL, book)
+            px = self._maker_price(Side.SELL, book)
             logger.info(
-                "IMBALANCE: long filled=%s short=%s — cancel C only, reprice C sell @ %s size=%s",
+                "IMBALANCE MAKER: long=%s short=%s — reprice C sell @ %s size=%s",
                 long_q,
                 short_q,
                 px,
@@ -417,15 +398,13 @@ class DeltaNeutralEngine:
             short_q = self._filled_short()
             need = self.target_size - short_q
             if need > tol:
-                self.order_c = self._place(
-                    self.acc2, Side.SELL, px, need, tag="C", post_only=False
-                )
+                self.order_c = self._place(self.acc2, Side.SELL, px, need, tag="C")
 
         elif short_q > tol and long_q < self.target_size - tol:
             need = self.target_size - long_q
-            px = self._aggressive_price(Side.BUY, book)
+            px = self._maker_price(Side.BUY, book)
             logger.info(
-                "IMBALANCE: short filled=%s long=%s — cancel A only, reprice A buy @ %s size=%s",
+                "IMBALANCE MAKER: short=%s long=%s — reprice A buy @ %s size=%s",
                 short_q,
                 long_q,
                 px,
@@ -437,9 +416,7 @@ class DeltaNeutralEngine:
             long_q = self._filled_long()
             need = self.target_size - long_q
             if need > tol:
-                self.order_a = self._place(
-                    self.acc1, Side.BUY, px, need, tag="A", post_only=False
-                )
+                self.order_a = self._place(self.acc1, Side.BUY, px, need, tag="A")
 
         self.last_reprice = time.time()
 
@@ -461,12 +438,19 @@ class DeltaNeutralEngine:
         self.order_d = self._refresh_order(self.acc2, self.order_d)
 
         if long_q > self._tol() and not self._is_open(self.order_b):
-            # only re-place if fully gone — not a timed cancel
             if self.order_b is None or self.order_b.is_terminal:
-                logger.info("B missing — place once sell @ %s size=%s", self.close_price, long_q)
+                logger.info("B missing — MAKER sell @ %s size=%s", self.close_price, long_q)
                 self.order_b = self._place(
-                    self.acc1, Side.SELL, self.close_price, long_q, tag="B", post_only=False
+                    self.acc1, Side.SELL, self.close_price, long_q, tag="B"
                 )
+                if self.order_b is None:
+                    self.order_b = self._place(
+                        self.acc1,
+                        Side.SELL,
+                        self._maker_price(Side.SELL, book),
+                        long_q,
+                        tag="B",
+                    )
 
         if short_q > self._tol() and not self._is_open(self.order_d):
             if self.order_d is None or self.order_d.is_terminal:
@@ -525,19 +509,15 @@ class DeltaNeutralEngine:
             self.dual_book_close_active = False
             return
 
-        # Same moment: close long + close short at current book
+        # Same moment: close long + close short as MAKER (join ask / join bid)
         if long_q > tol:
-            px_b = self._aggressive_price(Side.SELL, book)
-            self.order_b = self._place(
-                self.acc1, Side.SELL, px_b, long_q, tag="B", post_only=False
-            )
-            logger.info("DUAL B sell (close long) @ %s size=%s", px_b, long_q)
+            px_b = self._maker_price(Side.SELL, book)
+            self.order_b = self._place(self.acc1, Side.SELL, px_b, long_q, tag="B")
+            logger.info("DUAL MAKER B sell @ %s size=%s", px_b, long_q)
         if short_q > tol:
-            px_d = self._aggressive_price(Side.BUY, book)
-            self.order_d = self._place(
-                self.acc2, Side.BUY, px_d, short_q, tag="D", post_only=False
-            )
-            logger.info("DUAL D buy (close short) @ %s size=%s", px_d, short_q)
+            px_d = self._maker_price(Side.BUY, book)
+            self.order_d = self._place(self.acc2, Side.BUY, px_d, short_q, tag="D")
+            logger.info("DUAL MAKER D buy @ %s size=%s", px_d, short_q)
 
         self.dual_book_close_active = True
         self.emergency_active = False
@@ -586,7 +566,7 @@ class DeltaNeutralEngine:
 
         if long_q <= tol and short_q > tol:
             logger.info(
-                "E only: B/Acc1 done, D not done — cancel D, place E buy at book short=%s",
+                "E MAKER only: Acc1 flat, Acc2 short=%s — cancel D, place E buy join bid",
                 short_q,
             )
             if self._is_open(self.order_d):
@@ -598,18 +578,16 @@ class DeltaNeutralEngine:
             short_q = self._filled_short()
             if short_q <= tol:
                 return
-            px = self._aggressive_price(Side.BUY, book)
-            self.order_e = self._place(
-                self.acc2, Side.BUY, px, short_q, tag="E", post_only=False
-            )
-            logger.info("E buy @ %s size=%s", px, short_q)
+            px = self._maker_price(Side.BUY, book)
+            self.order_e = self._place(self.acc2, Side.BUY, px, short_q, tag="E")
+            logger.info("E MAKER buy @ %s size=%s", px, short_q)
             self.last_reprice = time.time()
             self.reprice_count += 1
             return
 
         if short_q <= tol and long_q > tol:
             logger.info(
-                "E only: D/Acc2 done, B not done — cancel B, place E sell at book long=%s",
+                "E MAKER only: Acc2 flat, Acc1 long=%s — cancel B, place E sell join ask",
                 long_q,
             )
             if self._is_open(self.order_b):
@@ -621,11 +599,9 @@ class DeltaNeutralEngine:
             long_q = self._filled_long()
             if long_q <= tol:
                 return
-            px = self._aggressive_price(Side.SELL, book)
-            self.order_e = self._place(
-                self.acc1, Side.SELL, px, long_q, tag="E", post_only=False
-            )
-            logger.info("E sell @ %s size=%s", px, long_q)
+            px = self._maker_price(Side.SELL, book)
+            self.order_e = self._place(self.acc1, Side.SELL, px, long_q, tag="E")
+            logger.info("E MAKER sell @ %s size=%s", px, long_q)
             self.last_reprice = time.time()
             self.reprice_count += 1
 
@@ -917,8 +893,8 @@ class MultiMarketRunner:
     def run(self) -> None:
         markets = ", ".join(cfg.markets if (cfg := self.cfg) else [])
         logger.info(
-            "Multi-market bot start | markets=[%s] | parallel | each margin share=1/%s | "
-            "close +%s%% | dry=%s",
+            "Multi-market bot start | markets=[%s] | parallel | margin share=1/%s | "
+            "close +%s%% | MAKER-ONLY postOnly | dry=%s",
             markets,
             max(len(self.cfg.markets), 1),
             self.cfg.strategy.close_price_pct,
